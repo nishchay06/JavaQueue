@@ -11,6 +11,13 @@ public class MessageQueue {
 
     public final String name;
 
+    private final QueueConfig config;
+    private MessageQueue deadLetterQueue;
+    private final Thread scannerThread;
+
+    // Tracks retry count per message ID across requeues
+    private final Map<String, Integer> retryCounts = new HashMap<>();
+
     // The actual queue of messages waiting to be consumed.
     // LinkedList implements Queue — gives us O(1) add to tail, remove from head.
     private final Queue<Message> messages = new LinkedList<>();
@@ -18,10 +25,24 @@ public class MessageQueue {
     // Tracks messages that have been consumed but not yet acknowledged.
     // Key = receipt handle, Value = the message.
     // Shares the same intrinsic lock as messages — no extra synchronization needed.
-    private final Map<String, Message> inFlightMessages = new HashMap<>();
+    final Map<String, InFlightEntry> inFlightMessages = new HashMap<>();
 
     public MessageQueue(String name) {
+        this(name, QueueConfig.defaults());
+    }
+
+    public MessageQueue(String name, QueueConfig config) {
+        this(name, config, 1000);
+    }
+
+    public MessageQueue(String name, QueueConfig config, long scanIntervalMs) {
         this.name = name;
+        this.config = config;
+
+        VisibilityScanner scanner = new VisibilityScanner(this, scanIntervalMs);
+        this.scannerThread = new Thread(scanner, "scanner-" + name);
+        this.scannerThread.setDaemon(true);
+        this.scannerThread.start();
     }
 
     public void publish(Message message) {
@@ -49,22 +70,83 @@ public class MessageQueue {
             Message message = messages.poll();
             Receipt receipt = new Receipt(message);
 
-            inFlightMessages.put(receipt.getReceiptHandle(), message);
+            int retryCount = retryCounts.getOrDefault(message.getId(), 0);
+            inFlightMessages.put(receipt.getReceiptHandle(), new InFlightEntry(message, retryCount));
             return receipt;
         }
     }
 
     public void acknowledge(String receiptHandle) {
         synchronized (this) {
-            Message message = inFlightMessages.remove(receiptHandle);
+            InFlightEntry inFlightEntry = inFlightMessages.remove(receiptHandle);
 
-            if (message == null) {
+            if (inFlightEntry == null) {
                 throw new InvalidReceiptException(receiptHandle);
             }
+            retryCounts.remove(inFlightEntry.getMessage().getId());
+        }
+    }
+
+    public void close() {
+        scannerThread.interrupt();
+        try {
+            scannerThread.join();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    public void setDeadLetterQueue(MessageQueue dlq) {
+        this.deadLetterQueue = dlq;
+    }
+
+    private void requeueOrDeadLetter(Message message, int newRetryCount) {
+        if (newRetryCount >= config.getMaxRetries()) {
+            retryCounts.remove(message.getId());
+            if (deadLetterQueue != null) {
+                deadLetterQueue.publish(message);
+            } else {
+                System.err.println("WARNING: Message " + message.getId()
+                        + " exceeded max retries and has been dropped from queue '"
+                        + name + "'");
+            }
+        } else {
+            retryCounts.put(message.getId(), newRetryCount);
+            messages.add(message);
+            notifyAll();
+        }
+    }
+
+    public void scanAndRequeue() {
+        synchronized (this) {
+            inFlightMessages.entrySet().stream()
+                    .filter(e -> e.getValue().isTimedOut(config.getVisibilityTimeoutMs()))
+                    .map(Map.Entry::getKey)
+                    .toList() // collects to a new list before we start removing — avoids
+                              // ConcurrentModificationException
+                    .forEach(handle -> {
+                        InFlightEntry entry = inFlightMessages.remove(handle);
+                        requeueOrDeadLetter(entry.getMessage(), entry.getRetryCount() + 1);
+                    });
+        }
+    }
+
+    public void nack(String receiptHandle) {
+        synchronized (this) {
+            InFlightEntry entry = inFlightMessages.remove(receiptHandle);
+            if (entry == null) {
+                throw new InvalidReceiptException(receiptHandle);
+            }
+            requeueOrDeadLetter(entry.getMessage(), entry.getRetryCount() + 1);
         }
     }
 
     public String getName() {
         return name;
+    }
+
+    // Package-private for testing
+    Thread getScannerThread() {
+        return scannerThread;
     }
 }

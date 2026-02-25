@@ -13,9 +13,23 @@ public class QueueManager {
     private final ConcurrentHashMap<String, MessageQueue> queues = new ConcurrentHashMap<>();
 
     public MessageQueue createQueue(String name) {
+        return createQueue(name, QueueConfig.defaults());
+    }
+
+    public MessageQueue createQueue(String name, QueueConfig config) {
         // computeIfAbsent is atomic — if two threads call createQueue("orders")
         // simultaneously, only one MessageQueue is created. Not two.
-        return queues.computeIfAbsent(name, MessageQueue::new);
+        MessageQueue queue = queues.computeIfAbsent(name,
+                n -> new MessageQueue(n, config));
+
+        String dlqName = config.getDeadLetterQueueName();
+        if (dlqName != null) {
+            MessageQueue dlq = queues.computeIfAbsent(dlqName,
+                    n -> new MessageQueue(n, QueueConfig.defaults()));
+            queue.setDeadLetterQueue(dlq);
+        }
+
+        return queue;
     }
 
     public MessageQueue getQueue(String name) {
@@ -27,7 +41,10 @@ public class QueueManager {
     }
 
     public void deleteQueue(String name) {
-        queues.remove(name);
+        MessageQueue queue = queues.remove(name);
+        if (queue != null) {
+            queue.close();
+        }
     }
 
     public Set<String> listQueues() {
@@ -36,17 +53,18 @@ public class QueueManager {
 }
 
 /*
-Why not this?
-if (!queues.containsKey(name)) {
-    queues.put(name, new MessageQueue(name));
-}
-```
-
-Because that's two separate operations — `containsKey` and `put`. Another thread could slip in between them:
-```
-Thread 1: containsKey("orders") → false
-Thread 2: containsKey("orders") → false      ← both see it missing
-Thread 1: put("orders", new MessageQueue())
-Thread 2: put("orders", new MessageQueue())  ← overwrites Thread 1's queue!
-
-*/ 
+ * Why not this?
+ * if (!queues.containsKey(name)) {
+ * queues.put(name, new MessageQueue(name));
+ * }
+ * ```
+ * 
+ * Because that's two separate operations — `containsKey` and `put`. Another
+ * thread could slip in between them:
+ * ```
+ * Thread 1: containsKey("orders") → false
+ * Thread 2: containsKey("orders") → false ← both see it missing
+ * Thread 1: put("orders", new MessageQueue())
+ * Thread 2: put("orders", new MessageQueue()) ← overwrites Thread 1's queue!
+ * 
+ */

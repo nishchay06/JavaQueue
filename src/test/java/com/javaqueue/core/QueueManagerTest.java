@@ -6,6 +6,8 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -93,5 +95,65 @@ public class QueueManagerTest {
         MessageQueue first = results.peek();
         assertTrue(results.stream().allMatch(q -> q == first),
                 "Multiple queue instances created — computeIfAbsent is broken");
+    }
+
+    // ── Test 8: createQueue with custom config ────────────────────────────────
+    @Test
+    void testCreateQueueWithConfig() throws InterruptedException {
+        QueueConfig config = new QueueConfig(500, 2, null);
+        MessageQueue queue = manager.createQueue("configured-queue", config);
+
+        assertNotNull(queue);
+
+        // Verify config is applied — publish, consume, NACK twice, message should drop
+        queue.publish(new Message("hello"));
+
+        Receipt r1 = queue.consume();
+        queue.nack(r1.getReceiptHandle()); // retryCount = 1
+
+        Receipt r2 = queue.consume();
+        queue.nack(r2.getReceiptHandle()); // retryCount = 2 — hits limit
+
+        // Queue should be empty now
+        queue.publish(new Message("sentinel"));
+        Receipt r3 = queue.consume();
+        assertEquals("sentinel", r3.getMessage().getPayload());
+    }
+
+    // ── Test 9: deleteQueue stops scanner thread ──────────────────────────────
+    @Test
+    void testDeleteQueueStopsScanner() throws InterruptedException {
+        manager.createQueue("temp-queue");
+        MessageQueue queue = manager.getQueue("temp-queue");
+
+        assertTrue(queue.getScannerThread().isAlive());
+
+        manager.deleteQueue("temp-queue");
+
+        assertFalse(queue.getScannerThread().isAlive());
+    }
+
+    // ── Test 10: DLQ is wired automatically ──────────────────────────────────
+    @Test
+    void testDlqWiredAutomatically() throws InterruptedException {
+        QueueConfig config = new QueueConfig(100, 2, "my-dlq");
+        MessageQueue queue = manager.createQueue("main-queue", config);
+
+        // DLQ should have been auto-created
+        assertNotNull(manager.getQueue("my-dlq"));
+
+        // Exhaust retries — message should land in DLQ
+        queue.publish(new Message("hello"));
+
+        Receipt r1 = queue.consume();
+        queue.nack(r1.getReceiptHandle());
+
+        Receipt r2 = queue.consume();
+        queue.nack(r2.getReceiptHandle());
+
+        // Verify message arrived in DLQ
+        MessageQueue dlq = manager.getQueue("my-dlq");
+        Receipt dlqReceipt = dlq.consume();
+        assertEquals("hello", dlqReceipt.getMessage().getPayload());
     }
 }
