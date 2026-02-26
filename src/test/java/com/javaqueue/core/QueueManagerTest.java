@@ -100,7 +100,7 @@ public class QueueManagerTest {
     // ── Test 8: createQueue with custom config ────────────────────────────────
     @Test
     void testCreateQueueWithConfig() throws InterruptedException {
-        QueueConfig config = new QueueConfig(500, 2, null);
+        QueueConfig config = new QueueConfig(500, 2, null, null);
         MessageQueue queue = manager.createQueue("configured-queue", config);
 
         assertNotNull(queue);
@@ -136,7 +136,7 @@ public class QueueManagerTest {
     // ── Test 10: DLQ is wired automatically ──────────────────────────────────
     @Test
     void testDlqWiredAutomatically() throws InterruptedException {
-        QueueConfig config = new QueueConfig(100, 2, "my-dlq");
+        QueueConfig config = new QueueConfig(100, 2, "my-dlq", null);
         MessageQueue queue = manager.createQueue("main-queue", config);
 
         // DLQ should have been auto-created

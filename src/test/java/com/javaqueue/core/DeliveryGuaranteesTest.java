@@ -22,7 +22,7 @@ public class DeliveryGuaranteesTest {
 
     @BeforeEach
     void setUp() {
-        QueueConfig config = new QueueConfig(VISIBILITY_TIMEOUT_MS, 3, null);
+        QueueConfig config = new QueueConfig(VISIBILITY_TIMEOUT_MS, 3, null, null);
         queue = new MessageQueue("test-queue", config, SCAN_INTERVAL_MS);
     }
 
@@ -114,7 +114,7 @@ public class DeliveryGuaranteesTest {
     @Test
     void testRetryLimitDropsMessageWhenNoDlq() throws InterruptedException {
         // maxRetries = 2 — message dropped after 2 NACKs
-        QueueConfig config = new QueueConfig(VISIBILITY_TIMEOUT_MS, 2, null);
+        QueueConfig config = new QueueConfig(VISIBILITY_TIMEOUT_MS, 2, null, null);
         MessageQueue q = new MessageQueue("drop-queue", config, SCAN_INTERVAL_MS);
 
         q.publish(new Message("hello"));
@@ -139,7 +139,7 @@ public class DeliveryGuaranteesTest {
         MessageQueue dlq = new MessageQueue("dlq",
                 QueueConfig.defaults(), SCAN_INTERVAL_MS);
 
-        QueueConfig config = new QueueConfig(VISIBILITY_TIMEOUT_MS, 2, "dlq");
+        QueueConfig config = new QueueConfig(VISIBILITY_TIMEOUT_MS, 2, "dlq", null);
         MessageQueue q = new MessageQueue("main-queue", config, SCAN_INTERVAL_MS);
         q.setDeadLetterQueue(dlq);
 

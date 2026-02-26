@@ -17,6 +17,13 @@ public final class Message {
         this.payload = payload;
     }
 
+    // Used during WAL replay — restores a message with its original ID.
+    // Not for general use — always use Message(String payload) in production code.
+    Message(String id, String payload) {
+        this.id = id;
+        this.payload = payload;
+    }
+
     public String getId() {
         return id;
     }

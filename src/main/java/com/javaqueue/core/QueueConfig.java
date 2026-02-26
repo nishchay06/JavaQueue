@@ -13,15 +13,19 @@ public class QueueConfig {
     // Name of the dead letter queue. Null means drop on retry exhaustion.
     private final String deadLetterQueueName;
 
-    public QueueConfig(long visibilityTimeoutMs, int maxRetries, String deadLetterQueueName) {
+    private final String logDirectory;
+
+    public QueueConfig(long visibilityTimeoutMs, int maxRetries, 
+        String deadLetterQueueName, String logDirectory) {
         this.visibilityTimeoutMs = visibilityTimeoutMs;
         this.maxRetries = maxRetries;
         this.deadLetterQueueName = deadLetterQueueName;
+        this.logDirectory = logDirectory;
     }
 
     // Convenience factory — used when creating queues without explicit config.
     public static QueueConfig defaults() {
-        return new QueueConfig(30_000, 3, null);
+        return new QueueConfig(30_000, 3, null, null);
     }
 
     public long getVisibilityTimeoutMs() {
@@ -34,5 +38,9 @@ public class QueueConfig {
 
     public String getDeadLetterQueueName() {
         return deadLetterQueueName;
+    }
+
+    public String getLogDirectory() {
+        return logDirectory;
     }
 }
