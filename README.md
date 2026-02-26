@@ -14,6 +14,7 @@ Using SQS at work gives you the interface of a message queue, not the internals.
 - What does "blocking" actually mean at the thread level, and how is it implemented?
 - How do delivery guarantees like at-least-once work mechanically?
 - What happens when a consumer crashes mid-processing — how does the queue recover?
+- How do production systems ensure messages survive a server restart?
 - What trade-offs exist between throughput, durability, and complexity?
 
 ---
@@ -33,9 +34,13 @@ javaqueue/
     │           │   ├── Receipt.java           # Unique per delivery, used to ACK
     │           │   ├── MessageQueue.java      # Core queue — all concurrency lives here
     │           │   ├── QueueManager.java      # Thread-safe registry of named queues
-    │           │   ├── QueueConfig.java       # Visibility timeout, max retries, DLQ name
+    │           │   ├── QueueConfig.java       # Visibility timeout, max retries, DLQ, log dir
     │           │   ├── InFlightEntry.java     # Tracks message + timestamp + retry count
-    │           │   └── VisibilityScanner.java # Daemon thread — requeues timed-out messages
+    │           │   ├── VisibilityScanner.java # Daemon thread — requeues timed-out messages
+    │           │   ├── LogEntry.java          # Immutable WAL record with JSON serializer
+    │           │   ├── LogOperation.java      # Enum: PUBLISH, CONSUME, ACK, NACK
+    │           │   ├── WalWriter.java         # Append-only log file writer
+    │           │   └── WalReader.java         # Replays log on startup
     │           └── exception/
     │               ├── QueueNotFoundException.java
     │               └── InvalidReceiptException.java
@@ -46,7 +51,9 @@ javaqueue/
                 │   ├── MessageTest.java
                 │   ├── MessageQueueTest.java
                 │   ├── QueueManagerTest.java
-                │   └── DeliveryGuaranteesTest.java
+                │   ├── DeliveryGuaranteesTest.java
+                │   ├── WalTest.java
+                │   └── PersistenceTest.java
                 └── concurrent/
                     ├── ConcurrentStressTest.java
                     └── DeliveryGuaranteesStressTest.java
@@ -60,7 +67,7 @@ javaqueue/
 |-------|------|--------|-------------|
 | 1 | In-Memory Core | ✅ Complete | Named queues, publish, blocking consume, ACK |
 | 2 | Delivery Guarantees | ✅ Complete | Visibility timeout, NACK, retry limit, dead letter queue |
-| 3 | Persistence | ⏳ Planned | Write-ahead log — messages survive JVM restart |
+| 3 | Persistence | ✅ Complete | Write-ahead log — messages survive JVM restart |
 | 4 | Networking | ⏳ Planned | HTTP API so external processes can connect |
 | 5 | Consumer Groups | ⏳ Planned | Kafka-style groups with per-group offsets |
 
@@ -132,6 +139,43 @@ publish()
 
 ---
 
+## Phase 3 — Persistence
+
+### The Problem Phase 2 Left Open
+
+Every queue is in-memory. If the JVM crashes, all messages in all queues are gone — including messages that were published but not yet consumed, and messages that were consumed but not yet acknowledged.
+
+### How It Works
+
+**Write-Ahead Log (WAL)** — before any state change is applied in memory, it is written to a log file on disk first. Every `publish()`, `consume()`, `acknowledge()`, and `nack()` appends one JSON entry to the queue's log file and flushes to disk immediately.
+
+**Replay on startup** — when a queue is created with a log directory, it reads the existing log file and replays every entry to reconstruct in-memory state. Messages that were in-flight at crash time are requeued (treated as implicit NACKs).
+
+**Log compaction** — after replay, the log is rewritten with only the surviving queued messages as PUBLISH entries. This prevents the log from growing unboundedly across restarts.
+
+### Log File Format
+
+One JSON entry per line, append-only:
+
+```
+{"op":"PUBLISH","msgId":"1","payload":"Order1","handle":"","retryCount":0,"ts":1700000001000}
+{"op":"CONSUME","msgId":"1","payload":"","handle":"abc-123","retryCount":0,"ts":1700000002000}
+{"op":"ACK","msgId":"","payload":"","handle":"abc-123","retryCount":0,"ts":1700000003000}
+```
+
+### Key Design Decisions
+
+| Problem | Approach | Why |
+|---------|----------|-----|
+| Flush strategy | Flush after every write (fsync) | Zero message loss on crash — teaches the durability vs throughput trade-off viscerally |
+| Log structure | One file per queue | Clean separation, easier replay, mirrors Kafka partition logs |
+| In-flight on restart | Requeue (implicit NACK) | At-least-once — never lose a message, accept rare duplicates |
+| JSON format | Hand-written serializer, no libraries | Forces understanding of the format; no external dependencies |
+| Corrupted lines | Skip and warn | Partial writes at end of file are expected on crash — don't fail the whole replay |
+| Backward compatibility | `logDirectory: null` disables persistence | All Phase 1 and 2 behaviour unchanged when no log directory configured |
+
+---
+
 ## Getting Started
 
 **Prerequisites**
@@ -153,25 +197,33 @@ mvn compile exec:java -Dexec.mainClass="com.javaqueue.Main"
 mvn test -Dsurefire.useFile=false
 ```
 
+**Run with persistence enabled**
+```java
+QueueConfig config = new QueueConfig(30_000, 3, null, "/tmp/javaqueue-logs");
+MessageQueue queue = manager.createQueue("orders", config);
+```
+
 ---
 
 ## Test Results
 
 ```
-Tests run: 37, Failures: 0, Errors: 0, Skipped: 0
+Tests run: 49, Failures: 0, Errors: 0, Skipped: 0
 
 ├── MessageTest                    4 tests  — value object correctness, concurrent ID uniqueness
 ├── MessageQueueTest               6 tests  — blocking consume, ACK, concurrent producers/consumers
 ├── QueueManagerTest              10 tests  — create, delete, config, DLQ wiring, scanner shutdown
 ├── DeliveryGuaranteesTest        10 tests  — timeout requeue, NACK, retry limit, DLQ, close()
-├── ConcurrentStressTest           3 tests  — 4M+ messages, sustained load, backlog draining
+├── WalTest                        5 tests  — WAL read/write/compact, all entry types round-trip
+├── PersistenceTest                7 tests  — survive restart, compaction, retry count preserved
+├── ConcurrentStressTest           3 tests  — 3.7M messages, sustained load, backlog draining
 └── DeliveryGuaranteesStressTest   4 tests  — concurrent NACKs, scanner + consumers, DLQ under load
 ```
 
-Stress test results (5 producers, 5 consumers, 3 seconds, visibility timeout enabled):
+Stress test results (5 producers, 5 consumers, 3 seconds):
 ```
-Published: 2,438,483
-Consumed:  2,438,483
+Published: 2,631,944
+Consumed:  2,631,944
 ```
 
 ---
@@ -194,3 +246,11 @@ Consumed:  2,438,483
 - Retry state tracking across multiple requeues
 - Lock independence — why publishing to a DLQ inside a `synchronized` block is safe
 - Immutability as a correctness guarantee, even inside synchronized blocks
+
+**Phase 3**
+- Write-ahead log — the foundation of every durable storage system
+- Why flush-every-write destroys throughput (and why Kafka batches)
+- Log compaction — why it exists and what problem it solves
+- Crash recovery — replaying a log to reconstruct state
+- Why `notifyAll()` requires a monitor (`IllegalMonitorStateException`)
+- Hand-written serialization — understanding the format you depend on
