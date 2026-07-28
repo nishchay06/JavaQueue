@@ -13,6 +13,7 @@
   <properties>
     <maven.compiler.release>21</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <exec.mainClass>com.javaqueue.Main</exec.mainClass>
   </properties>
 
   <dependencies>
@@ -22,6 +23,28 @@
       <artifactId>junit-jupiter</artifactId>
       <version>5.10.2</version>
       <scope>test</scope>
+    </dependency>
+
+    <!-- Jetty 12 — HTTP server for Phase 4 networking -->
+    <dependency>
+      <groupId>org.eclipse.jetty</groupId>
+      <artifactId>jetty-server</artifactId>
+      <version>12.0.14</version>
+    </dependency>
+    <dependency>
+      <groupId>org.eclipse.jetty</groupId>
+      <artifactId>jetty-http</artifactId>
+      <version>12.0.14</version>
+    </dependency>
+    <!-- No jetty-ee10-servlet: QueueHandler extends Jetty 12's core
+         Handler.Abstract, which lives in jetty-server. The Servlet API is only
+         needed if you want jakarta.servlet types, which this project doesn't. -->
+
+    <!-- exec:java runs Main on the runtime classpath -->
+    <dependency>
+      <groupId>org.eclipse.jetty</groupId>
+      <artifactId>jetty-util</artifactId>
+      <version>12.0.14</version>
     </dependency>
   </dependencies>
 
