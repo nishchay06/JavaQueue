@@ -2,12 +2,15 @@ package com.javaqueue.core;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Queue;
+import java.util.function.Consumer;
 
 import com.javaqueue.exception.InvalidReceiptException;
 
@@ -35,7 +38,52 @@ public class MessageQueue {
     // Shares the same intrinsic lock as messages — no extra synchronization needed.
     final Map<String, InFlightEntry> inFlightMessages = new HashMap<>();
 
+    // Consumers that registered interest and went away rather than parking a
+    // thread. Guarded by this queue's monitor, like everything else here.
+    private final Deque<AsyncWaiter> waiters = new ArrayDeque<>();
+
     private final WalWriter walWriter;
+
+    /** Handle on a registered async consume, so the caller can give up. */
+    public interface Waiter {
+        /**
+         * @return true if this cancelled a wait that was still pending; false
+         *         if a message had already been delivered to it
+         */
+        boolean cancel();
+    }
+
+    private final class AsyncWaiter implements Waiter {
+        private final Consumer<Receipt> handler;
+        private boolean settled; // guarded by MessageQueue.this
+
+        AsyncWaiter(Consumer<Receipt> handler) {
+            this.handler = handler;
+        }
+
+        @Override
+        public boolean cancel() {
+            synchronized (MessageQueue.this) {
+                if (settled) {
+                    return false;
+                }
+                settled = true;
+                waiters.remove(this);
+                return true;
+            }
+        }
+    }
+
+    /**
+     * A message claimed by a waiter, to be handed over once the monitor is
+     * released — the caller's handler must never run while we hold the lock.
+     */
+    private record Delivery(AsyncWaiter waiter, Receipt receipt) {
+
+        void dispatch() {
+            waiter.handler.accept(receipt);
+        }
+    }
 
     public MessageQueue(String name) {
         this(name, QueueConfig.defaults());
@@ -79,7 +127,69 @@ public class MessageQueue {
     }
 
     public void publish(Message message) {
+        Delivery delivery;
+
         synchronized (this) {
+            if (walWriter != null) {
+                try {
+                    walWriter.append(LogEntry.publish(message));
+                } catch (IOException e) {
+                    System.err.println("WARNING: Could not write to WAL: " + e.getMessage());
+                }
+            }
+            delivery = enqueueOrHandOff(message);
+        }
+
+        // Outside the monitor: the handler is caller code and may do anything,
+        // including publishing to another queue. Same rule as the dead letter
+        // path — never run someone else's code while holding this lock.
+        if (delivery != null) {
+            delivery.dispatch();
+        }
+    }
+
+    /**
+     * Registers interest in the next message without holding a thread.
+     *
+     * If a message is available the handler runs on the calling thread before
+     * this returns. Otherwise the waiter is queued and a later publish, nack,
+     * or visibility-timeout requeue hands the message straight to it.
+     *
+     * The handler runs at most once. Callers that want to give up — a long
+     * poll reaching its deadline, say — must cancel the returned Waiter.
+     */
+    public Waiter consumeAsync(Consumer<Receipt> handler) {
+        AsyncWaiter waiter = new AsyncWaiter(handler);
+        Receipt immediate = null;
+
+        synchronized (this) {
+            if (messages.isEmpty()) {
+                waiters.add(waiter);
+            } else {
+                waiter.settled = true;
+                immediate = deliverMessage(messages.poll());
+            }
+        }
+
+        if (immediate != null) {
+            handler.accept(immediate);
+        }
+        return waiter;
+    }
+
+    /**
+     * Hands the message to a waiting async consumer, or queues it if there is
+     * none. Caller MUST hold the monitor.
+     *
+     * An async waiter is preferred over a thread blocked in consume(): it is
+     * already registered, and waking a blocked thread only for it to lose the
+     * race is wasted work. Either way exactly one consumer gets the message.
+     *
+     * @return the delivery to dispatch after releasing the monitor, or null
+     */
+    private Delivery enqueueOrHandOff(Message message) {
+        AsyncWaiter waiter = waiters.poll();
+        if (waiter == null) {
             messages.add(message);
 
             // Wake up all threads waiting in consume().
@@ -88,15 +198,11 @@ public class MessageQueue {
             // waiting for a message. notifyAll() is safer, the while loop
             // in consume() handles the case where a woken thread loses the race.
             notifyAll();
-
-            if (walWriter != null) {
-                try {
-                    walWriter.append(LogEntry.publish(message));
-                } catch (IOException e) {
-                    System.err.println("WARNING: Could not write to WAL: " + e.getMessage());
-                }
-            }
+            return null;
         }
+
+        waiter.settled = true;
+        return new Delivery(waiter, deliverMessage(message));
     }
 
     public Receipt consume() throws InterruptedException {
@@ -136,7 +242,13 @@ public class MessageQueue {
     // Moves the head message to in-flight and returns its receipt.
     // Caller MUST hold this object's monitor, and messages MUST be non-empty.
     private Receipt deliverNext() {
-        Message message = messages.poll();
+        return deliverMessage(messages.poll());
+    }
+
+    // Marks a message as delivered: in-flight, receipted, recorded in the WAL.
+    // Caller MUST hold this object's monitor. The message may come from the
+    // queue (deliverNext) or straight from a publish that found a waiter.
+    private Receipt deliverMessage(Message message) {
         Receipt receipt = new Receipt(message);
 
         int retryCount = retryCounts.getOrDefault(message.getId(), 0);
@@ -207,13 +319,18 @@ public class MessageQueue {
      * So the message is handed back instead, and the caller publishes it once
      * it has released this monitor. See flushToDeadLetterQueue.
      *
+     * @param deliveries collects any hand-off to a waiting async consumer, to
+     *                   be dispatched by the caller after the monitor is released
      * @return the message to publish to the DLQ, or null if nothing leaves
      */
-    private Message requeueOrDeadLetter(Message message, int newRetryCount) {
+    private Message requeueOrDeadLetter(Message message, int newRetryCount,
+            List<Delivery> deliveries) {
         if (newRetryCount < config.getMaxRetries()) {
             retryCounts.put(message.getId(), newRetryCount);
-            messages.add(message);
-            notifyAll();
+            Delivery delivery = enqueueOrHandOff(message);
+            if (delivery != null) {
+                deliveries.add(delivery);
+            }
             return null;
         }
 
@@ -248,6 +365,7 @@ public class MessageQueue {
 
     public void scanAndRequeue() {
         List<Message> departing = new ArrayList<>();
+        List<Delivery> deliveries = new ArrayList<>();
         MessageQueue dlq;
 
         synchronized (this) {
@@ -260,18 +378,28 @@ public class MessageQueue {
                     .forEach(handle -> {
                         InFlightEntry entry = inFlightMessages.remove(handle);
                         Message leaving = requeueOrDeadLetter(entry.getMessage(),
-                                entry.getRetryCount() + 1);
+                                entry.getRetryCount() + 1, deliveries);
                         if (leaving != null) {
                             departing.add(leaving);
                         }
                     });
         }
 
+        dispatch(deliveries);
         flushToDeadLetterQueue(dlq, departing);
+    }
+
+    // Hands claimed messages to their waiters. MUST be called with the monitor
+    // released — the handlers are caller code.
+    private void dispatch(List<Delivery> deliveries) {
+        for (Delivery delivery : deliveries) {
+            delivery.dispatch();
+        }
     }
 
     public void nack(String receiptHandle) {
         List<Message> departing = new ArrayList<>();
+        List<Delivery> deliveries = new ArrayList<>();
         MessageQueue dlq;
 
         synchronized (this) {
@@ -289,12 +417,14 @@ public class MessageQueue {
                 }
             }
 
-            Message leaving = requeueOrDeadLetter(entry.getMessage(), entry.getRetryCount() + 1);
+            Message leaving = requeueOrDeadLetter(entry.getMessage(),
+                    entry.getRetryCount() + 1, deliveries);
             if (leaving != null) {
                 departing.add(leaving);
             }
         }
 
+        dispatch(deliveries);
         flushToDeadLetterQueue(dlq, departing);
     }
 
@@ -308,6 +438,9 @@ public class MessageQueue {
     // wired up by QueueManager after the constructor returns.
     private List<Message> replay(List<LogEntry> entries) {
         List<Message> departing = new ArrayList<>();
+        // Nobody can be waiting during construction, so this stays empty —
+        // it exists to satisfy requeueOrDeadLetter's contract.
+        List<Delivery> deliveries = new ArrayList<>();
 
         for (LogEntry entry : entries) {
             switch (entry.getOp()) {
@@ -343,7 +476,7 @@ public class MessageQueue {
                     InFlightEntry removed = inFlightMessages.remove(entry.getHandle());
                     if (removed != null) {
                         Message leaving = requeueOrDeadLetter(removed.getMessage(),
-                                removed.getRetryCount() + 1);
+                                removed.getRetryCount() + 1, deliveries);
                         if (leaving != null) {
                             departing.add(leaving);
                         }
@@ -358,7 +491,7 @@ public class MessageQueue {
                 .forEach(e -> {
                     inFlightMessages.remove(e.getKey());
                     Message leaving = requeueOrDeadLetter(e.getValue().getMessage(),
-                            e.getValue().getRetryCount() + 1);
+                            e.getValue().getRetryCount() + 1, deliveries);
                     if (leaving != null) {
                         departing.add(leaving);
                     }

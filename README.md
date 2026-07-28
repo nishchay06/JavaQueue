@@ -67,7 +67,9 @@ javaqueue/
                 │   ├── PersistenceTest.java
                 │   ├── TopicTest.java
                 │   ├── FanOutTest.java
-                │   └── TopicPersistenceTest.java
+                │   ├── TopicPersistenceTest.java
+                │   ├── AsyncConsumeTest.java
+                │   └── DefaultLogDirectoryTest.java
                 ├── json/
                 │   └── JsonUtilsTest.java
                 ├── server/
@@ -89,6 +91,7 @@ javaqueue/
 | 3 | Persistence | ✅ Complete | Write-ahead log — messages survive JVM restart |
 | 4 | Networking | ✅ Complete | HTTP API with long polling so external processes can connect |
 | 5 | Consumer Groups | ✅ Complete | SNS-style fan-out — a topic delivers to N subscriber queues |
+| 5.1 | Async Long Polling | ✅ Complete | Waiting costs a scheduled task, not a thread; durable-by-default log directory |
 | 6 | Partitioned Log | ⏳ Planned | Kafka-style retained log with per-group offsets, retention, partitions |
 
 ---
@@ -229,7 +232,7 @@ This is backed by a new `MessageQueue.consume(long timeoutMs)`, which uses `wait
 | Server owns the QueueManager? | Passed in from outside | Tests can inspect queue state directly instead of asserting everything through HTTP |
 | Lifecycle | Explicit `start()`, not auto-start in constructor | Constructing an object should not bind a socket |
 | Test ports | Bind port `0`, read back `getPort()` | OS picks a free port — no conflicts between parallel runs |
-| Blocking a Jetty thread while long polling | Allowed, but capped at 20s | Simplest correct approach; the cap stops slow clients from starving the thread pool |
+| Blocking a Jetty thread while long polling | Originally allowed, capped at 20s. **Replaced in Phase 5.1** — see below | Simplest correct approach to start with; the cap existed only to stop slow clients starving the pool |
 | Reading the request body | `Content.Source.asString()` | A single `request.read()` returns only the chunk that happens to be available — not the whole body |
 | JSON | Hand-written parser, now with full escaping | Phase 3's regex-splitting parser broke on commas and quotes in payloads; Phase 4 replaces it with a real character scanner |
 
@@ -341,6 +344,44 @@ Nothing in `MessageQueue` changed. Every Phase 2 guarantee and Phase 3 persisten
 
 There is deliberately **no** `GET /topics/{name}/messages` — it returns `405`, not `404`. The path exists; the operation does not. You consume from a subscriber queue, never from the topic. Making that impossible in the API is the clearest way to say that a topic routes rather than stores.
 
+---
+
+## Phase 5.1 — Long Polling Without a Thread, and Durable by Default
+
+Two things Phase 4 and 5 left half-finished.
+
+### Long polling used to cost a thread per waiting client
+
+`handleConsume` called the blocking `consume(timeout)`, which parks a Jetty pool thread for the entire wait. Forty idle clients meant forty parked threads, and the 20-second cap on `waitSeconds` existed purely to stop a handful of slow clients from starving the pool. The cap was treating the symptom.
+
+Jetty 12's `handle()` returning `true` means *"I will complete the callback"*, not *"I have completed it"* — so the response can be finished later, from another thread entirely. The request now registers interest and returns immediately:
+
+```java
+Waiter waiter = queue.consumeAsync(receipt -> { ... respond 200 ... });
+timeouts.schedule(() -> { if (waiter.cancel()) ...respond 204... }, waitSeconds, SECONDS);
+```
+
+`MessageQueue` gained `consumeAsync(Consumer<Receipt>)`, which either delivers inline if a message is available or queues a waiter. `publish` — along with `nack` and the visibility-timeout requeue — hands the message straight to a waiting consumer rather than enqueuing it. Whichever of delivery and timeout arrives first wins an `AtomicBoolean` and owns the response.
+
+Waiting now costs a scheduled task on **one** shared daemon thread, so the cap rose from 20 seconds to 300.
+
+**The test that proves it:** 40 simultaneous 2-second long polls against a server with a 6-thread pool. Measured on the blocking implementation it took **16,192ms** — roughly seven batches deep. On the async one, under 6,000ms. A test that passes both before and after the change would have proved nothing, so this one was run against both.
+
+**The delicate part:** `MessageQueue` hands a claimed message to its waiter only *after* releasing the monitor, because the handler is caller code that could do anything — including publishing to another queue. That is Phase 4.2's dead-letter rule generalised: never run someone else's code while holding this lock.
+
+### Durability was per-queue, so it was easy to lose
+
+A queue created without an explicit `logDirectory` silently lost its messages on restart. Over HTTP that meant every create body needed one, and an **auto-created dead letter queue could never be durable at all** — which defeats the point of a DLQ, since it exists to hold messages for later inspection.
+
+`QueueManager` now takes an optional default applying to any queue created without its own, DLQs included. An explicit `logDirectory` still wins. No default means no persistence, so nothing changed for existing callers.
+
+```bash
+mvn compile exec:java -Dexec.args="--log-dir=/var/lib/javaqueue"
+# Persistence: /var/lib/javaqueue
+```
+
+Note the asymmetry this exposes: queue *contents* survive a restart, but the *registry* does not. Topics persist their subscriber lists; queues do not persist their own existence, so the application must recreate them on startup. Worth closing at some point.
+
 ### Try It
 
 ```bash
@@ -373,6 +414,9 @@ mvn compile
 **Run** — starts the HTTP server on port 8080
 ```bash
 mvn compile exec:java
+
+# with persistence and a custom port
+mvn compile exec:java -Dexec.args="--log-dir=/var/lib/javaqueue --port=9090"
 ```
 
 **Test**
@@ -391,7 +435,7 @@ MessageQueue queue = manager.createQueue("orders", config);
 ## Test Results
 
 ```
-Tests run: 196, Failures: 0, Errors: 0, Skipped: 0
+Tests run: 218, Failures: 0, Errors: 0, Skipped: 0
 
 ├── MessageTest                    4 tests  — value object correctness, concurrent ID uniqueness
 ├── MessageQueueTest              12 tests  — blocking consume, timed consume, ACK, concurrency
@@ -404,7 +448,9 @@ Tests run: 196, Failures: 0, Errors: 0, Skipped: 0
 ├── TopicTest                     17 tests  — registry, subscription lifecycle, ownership boundary
 ├── FanOutTest                    18 tests  — delivery to N groups, no backfill, DLQ independence
 ├── TopicPersistenceTest          12 tests  — subscriptions survive restart, compaction, torn writes
-├── QueueServerTest               20 tests  — full HTTP round-trip, long polling, status codes, routing
+├── AsyncConsumeTest              14 tests  — callback consume, cancellation, publish/cancel races
+├── DefaultLogDirectoryTest        6 tests  — server-wide persistence default, DLQ inheritance
+├── QueueServerTest               22 tests  — HTTP round-trip, long polling under a starved thread pool
 ├── TopicServerTest               20 tests  — topic endpoints, fan-out over HTTP, the 405 asymmetry
 ├── ConcurrentStressTest           3 tests  — 5.1M messages, sustained load, backlog draining
 └── DeliveryGuaranteesStressTest   5 tests  — concurrent NACKs, scanner + consumers, DLQ cycles
@@ -465,3 +511,10 @@ Consumed:  5,093,389
 - Binding by name rather than by reference, and the stale-reference bug that motivates it
 - Persisting configuration, not just data — a lost subscriber list fails silently while looking healthy
 - Modelling an operation's absence in the API (405, not 404) as a design statement
+
+**Phase 5.1**
+- Asynchronous request completion — finishing an HTTP response from a thread that is not the request thread
+- Why a cap on wait time was treating the symptom, and what fixing the cause allows
+- Writing a test that fails on the old implementation, because one that passes on both proves nothing
+- Handing work to a callback outside the lock — the dead-letter rule generalised to all caller code
+- Defaults as a durability strategy: the safe thing should not require remembering
