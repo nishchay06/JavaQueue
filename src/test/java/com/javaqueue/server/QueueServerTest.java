@@ -11,6 +11,11 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -221,6 +226,94 @@ class QueueServerTest {
         assertEquals(200, response.statusCode());
         assertEquals("LateOrder", field(response.body(), "payload"));
         assertTrue(elapsed < 5000, "should have woken on publish, took " + elapsed + "ms");
+    }
+
+    // The point of async long polling: a waiting client costs a scheduled
+    // task, not a thread. With 40 simultaneous 2-second polls against a
+    // 6-thread server, a blocking implementation must run them ~7 batches
+    // deep (~14s). Holding no thread, they all finish in one wait.
+    @Test
+    void testLongPollsExceedTheServerThreadPool() throws Exception {
+        int maxThreads = 8; // 1 acceptor + 1 selector + 6 for requests
+        int pollers = 40;
+        int waitSeconds = 2;
+
+        QueueManager ownManager = new QueueManager();
+        QueueServer smallServer = new QueueServer(ownManager,
+                new TopicManager(ownManager), 0, maxThreads);
+        smallServer.start();
+        String url = "http://localhost:" + smallServer.getPort();
+
+        try {
+            ownManager.createQueue("orders");
+            ExecutorService clients = Executors.newFixedThreadPool(pollers);
+            CountDownLatch done = new CountDownLatch(pollers);
+            AtomicInteger noContent = new AtomicInteger();
+
+            long start = System.currentTimeMillis();
+            for (int i = 0; i < pollers; i++) {
+                clients.submit(() -> {
+                    try {
+                        HttpRequest request = HttpRequest.newBuilder(
+                                URI.create(url + "/queues/orders/messages?waitSeconds=" + waitSeconds))
+                                .GET().build();
+                        if (client.send(request, HttpResponse.BodyHandlers.ofString())
+                                .statusCode() == 204) {
+                            noContent.incrementAndGet();
+                        }
+                    } catch (Exception e) {
+                        // counted as a failure by the assertions below
+                    } finally {
+                        done.countDown();
+                    }
+                });
+            }
+
+            assertTrue(done.await(30, TimeUnit.SECONDS), "long polls did not all complete");
+            long elapsed = System.currentTimeMillis() - start;
+            clients.shutdownNow();
+
+            assertEquals(pollers, noContent.get(), "every poll should have returned 204");
+            assertTrue(elapsed < 6000,
+                    "polls appear to be serialised by the thread pool — took " + elapsed
+                            + "ms for " + pollers + " concurrent " + waitSeconds + "s polls on "
+                            + maxThreads + " threads");
+        } finally {
+            smallServer.stop();
+        }
+    }
+
+    // A message published while many clients are parked must wake exactly one.
+    @Test
+    void testPublishWakesExactlyOneOfManyLongPolls() throws Exception {
+        post("/queues/orders", null);
+        int pollers = 12;
+
+        ExecutorService clients = Executors.newFixedThreadPool(pollers);
+        CountDownLatch done = new CountDownLatch(pollers);
+        AtomicInteger got200 = new AtomicInteger();
+
+        for (int i = 0; i < pollers; i++) {
+            clients.submit(() -> {
+                try {
+                    if (get("/queues/orders/messages?waitSeconds=3").statusCode() == 200) {
+                        got200.incrementAndGet();
+                    }
+                } catch (Exception e) {
+                    // counted by the assertion below
+                } finally {
+                    done.countDown();
+                }
+            });
+        }
+
+        Thread.sleep(600); // let them all register
+        post("/queues/orders/messages", "{\"payload\":\"OnlyOne\"}");
+
+        assertTrue(done.await(15, TimeUnit.SECONDS));
+        clients.shutdownNow();
+
+        assertEquals(1, got200.get(), "exactly one waiting poll should receive the message");
     }
 
     @Test

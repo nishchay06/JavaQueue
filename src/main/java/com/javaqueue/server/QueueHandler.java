@@ -4,6 +4,12 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.eclipse.jetty.io.Content;
 import org.eclipse.jetty.server.Handler;
@@ -50,16 +56,31 @@ public class QueueHandler extends Handler.Abstract {
 
     static final int DEFAULT_WAIT_SECONDS = 5;
 
-    // Long polling parks a Jetty pool thread for the whole wait. Left uncapped,
-    // a handful of slow clients would starve the pool — so the wait is bounded.
-    static final int MAX_WAIT_SECONDS = 20;
+    // A waiting long poll no longer holds a thread, so this cap is about
+    // bounding client-visible latency rather than protecting the thread pool.
+    static final int MAX_WAIT_SECONDS = 300;
 
     private final QueueManager queueManager;
     private final TopicManager topicManager;
 
+    // Fires the 204 when a long poll reaches its deadline. One shared daemon
+    // thread for all pending polls — which is the entire point: waiting costs
+    // a scheduled task, not a thread.
+    private final ScheduledExecutorService timeouts = Executors.newSingleThreadScheduledExecutor(
+            runnable -> {
+                Thread thread = new Thread(runnable, "long-poll-timeouts");
+                thread.setDaemon(true);
+                return thread;
+            });
+
     public QueueHandler(QueueManager queueManager, TopicManager topicManager) {
         this.queueManager = queueManager;
         this.topicManager = topicManager;
+    }
+
+    /** Shuts down the timeout scheduler. Called by QueueServer.stop(). */
+    public void close() {
+        timeouts.shutdownNow();
     }
 
     @Override
@@ -367,19 +388,58 @@ public class QueueHandler extends Handler.Abstract {
         writeJson(response, callback, 201, JsonUtils.toJson(Map.of("messageId", message.getId())));
     }
 
-    // GET /queues/{name}/messages?waitSeconds=n
-    //   → 200 {"messageId":..,"payload":..,"receiptHandle":..} when a message arrives
-    //   → 204 when the wait expires with the queue still empty
-    private void handleConsume(String name, int waitSeconds, Response response, Callback callback)
-            throws InterruptedException {
+    /**
+     * GET /queues/{name}/messages?waitSeconds=n
+     *   → 200 {"messageId":..,"payload":..,"receiptHandle":..} when a message arrives
+     *   → 204 when the wait expires with the queue still empty
+     *
+     * This does not block. Blocking here would hold a Jetty pool thread for the
+     * whole wait, so N idle long-pollers would consume N threads and a few slow
+     * clients could starve the pool — which is why the wait used to be capped.
+     *
+     * Instead the request registers interest and returns; the response is
+     * completed later, either by the publish that hands over a message or by
+     * the scheduled timeout. Jetty allows this because handle() returning true
+     * means "I will complete the callback", not "I have completed it".
+     */
+    private void handleConsume(String name, int waitSeconds, Response response, Callback callback) {
         MessageQueue queue = queueManager.getQueue(name);
 
-        Receipt receipt = queue.consume(waitSeconds * 1000L);
-        if (receipt == null) {
-            writeEmpty(response, callback, 204);
+        // Whichever of delivery and timeout gets here first owns the response.
+        AtomicBoolean responded = new AtomicBoolean();
+        AtomicReference<ScheduledFuture<?>> timeout = new AtomicReference<>();
+
+        MessageQueue.Waiter waiter = queue.consumeAsync(receipt -> {
+            if (responded.compareAndSet(false, true)) {
+                ScheduledFuture<?> scheduled = timeout.get();
+                if (scheduled != null) {
+                    scheduled.cancel(false);
+                }
+                writeReceipt(response, callback, receipt);
+            }
+        });
+
+        // consumeAsync runs the handler inline when a message was already
+        // available, so this may already be settled.
+        if (responded.get()) {
             return;
         }
 
+        if (waitSeconds <= 0) {
+            if (waiter.cancel() && responded.compareAndSet(false, true)) {
+                writeEmpty(response, callback, 204);
+            }
+            return;
+        }
+
+        timeout.set(timeouts.schedule(() -> {
+            if (waiter.cancel() && responded.compareAndSet(false, true)) {
+                writeEmpty(response, callback, 204);
+            }
+        }, waitSeconds, TimeUnit.SECONDS));
+    }
+
+    private void writeReceipt(Response response, Callback callback, Receipt receipt) {
         // LinkedHashMap, not Map.of — response field order should be stable.
         Map<String, String> body = new LinkedHashMap<>();
         body.put("messageId", receipt.getMessage().getId());
