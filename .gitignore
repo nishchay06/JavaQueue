@@ -3,3 +3,4 @@ target/
 *.jar
 .vscode/
 .DS_Store
+project_state.md

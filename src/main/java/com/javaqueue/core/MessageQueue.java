@@ -101,23 +101,50 @@ public class MessageQueue {
             while (messages.isEmpty()) {
                 wait(); // releases the lock and sleeps until notifyAll() is called
             }
-
-            Message message = messages.poll();
-            Receipt receipt = new Receipt(message);
-
-            int retryCount = retryCounts.getOrDefault(message.getId(), 0);
-            inFlightMessages.put(receipt.getReceiptHandle(),
-                    new InFlightEntry(message, retryCount));
-
-            if (walWriter != null) {
-                try {
-                    walWriter.append(LogEntry.consume(message, receipt.getReceiptHandle(), retryCount));
-                } catch (IOException e) {
-                    System.err.println("WARNING: Could not write to WAL: " + e.getMessage());
-                }
-            }
-            return receipt;
+            return deliverNext();
         }
+    }
+
+    // Long-polling consume — waits up to timeoutMs for a message.
+    // Returns null if the timeout expires with the queue still empty.
+    // This is what HTTP long polling sits on: hold the connection instead of
+    // making the client hammer the server with empty GETs.
+    public Receipt consume(long timeoutMs) throws InterruptedException {
+        synchronized (this) {
+
+            // Deadline, not a plain wait(timeoutMs). A spurious wakeup or a
+            // lost race with another consumer would otherwise restart the full
+            // timeout each time round the loop.
+            long deadline = System.currentTimeMillis() + timeoutMs;
+            while (messages.isEmpty()) {
+                long remaining = deadline - System.currentTimeMillis();
+                if (remaining <= 0) {
+                    return null;
+                }
+                wait(remaining);
+            }
+            return deliverNext();
+        }
+    }
+
+    // Moves the head message to in-flight and returns its receipt.
+    // Caller MUST hold this object's monitor, and messages MUST be non-empty.
+    private Receipt deliverNext() {
+        Message message = messages.poll();
+        Receipt receipt = new Receipt(message);
+
+        int retryCount = retryCounts.getOrDefault(message.getId(), 0);
+        inFlightMessages.put(receipt.getReceiptHandle(),
+                new InFlightEntry(message, retryCount));
+
+        if (walWriter != null) {
+            try {
+                walWriter.append(LogEntry.consume(message, receipt.getReceiptHandle(), retryCount));
+            } catch (IOException e) {
+                System.err.println("WARNING: Could not write to WAL: " + e.getMessage());
+            }
+        }
+        return receipt;
     }
 
     public void acknowledge(String receiptHandle) {

@@ -41,6 +41,10 @@ javaqueue/
     │           │   ├── LogOperation.java      # Enum: PUBLISH, CONSUME, ACK, NACK
     │           │   ├── WalWriter.java         # Append-only log file writer
     │           │   └── WalReader.java         # Replays log on startup
+    │           ├── server/
+    │           │   ├── QueueServer.java       # Jetty lifecycle — start, stop, bound port
+    │           │   ├── QueueHandler.java      # Routes HTTP requests onto the QueueManager
+    │           │   └── JsonUtils.java         # Hand-written flat JSON parser and serializer
     │           └── exception/
     │               ├── QueueNotFoundException.java
     │               └── InvalidReceiptException.java
@@ -54,6 +58,8 @@ javaqueue/
                 │   ├── DeliveryGuaranteesTest.java
                 │   ├── WalTest.java
                 │   └── PersistenceTest.java
+                ├── server/
+                │   └── QueueServerTest.java
                 └── concurrent/
                     ├── ConcurrentStressTest.java
                     └── DeliveryGuaranteesStressTest.java
@@ -68,7 +74,7 @@ javaqueue/
 | 1 | In-Memory Core | ✅ Complete | Named queues, publish, blocking consume, ACK |
 | 2 | Delivery Guarantees | ✅ Complete | Visibility timeout, NACK, retry limit, dead letter queue |
 | 3 | Persistence | ✅ Complete | Write-ahead log — messages survive JVM restart |
-| 4 | Networking | ⏳ Planned | HTTP API so external processes can connect |
+| 4 | Networking | ✅ Complete | HTTP API with long polling so external processes can connect |
 | 5 | Consumer Groups | ⏳ Planned | Kafka-style groups with per-group offsets |
 
 ---
@@ -176,6 +182,56 @@ One JSON entry per line, append-only:
 
 ---
 
+## Phase 4 — Networking
+
+### The Problem Phase 3 Left Open
+
+Everything so far runs inside one JVM. A real queue is a *server* — producers and consumers are separate processes on separate machines. Phase 4 puts an HTTP API in front of the `QueueManager`.
+
+### API
+
+| Method | Path | Response |
+|--------|------|----------|
+| `GET` | `/queues` | `200` `{"queues":["orders"]}` |
+| `POST` | `/queues/{name}` | `201` `{"name":"orders"}` — optional JSON config body |
+| `DELETE` | `/queues/{name}` | `204`, or `404` if it never existed |
+| `POST` | `/queues/{name}/messages` | `201` `{"messageId":"42"}` — body `{"payload":"..."}` |
+| `GET` | `/queues/{name}/messages?waitSeconds=n` | `200` message + receipt handle, or `204` on timeout |
+| `DELETE` | `/queues/{name}/messages/{handle}` | `204` — acknowledge |
+| `POST` | `/queues/{name}/messages/{handle}/nack` | `204` — reject and requeue |
+
+Errors come back as `{"error":"..."}` with `400` (malformed body), `404` (unknown queue, bad receipt handle, unknown path), `405` (wrong method), or `500`.
+
+### Long Polling
+
+`GET /queues/{name}/messages` doesn't return empty immediately. It holds the connection open for up to `waitSeconds` (default 5) and returns as soon as a message arrives — the same mechanism SQS long polling uses to avoid clients hammering the server with empty receives.
+
+This is backed by a new `MessageQueue.consume(long timeoutMs)`, which uses `wait(remaining)` against a fixed deadline rather than a bare `wait(timeoutMs)`. The distinction matters: a spurious wakeup, or losing the race for a message to another consumer, would otherwise restart the full timeout on every pass through the loop.
+
+### Key Design Decisions
+
+| Problem | Approach | Why |
+|---------|----------|-----|
+| Server owns the QueueManager? | Passed in from outside | Tests can inspect queue state directly instead of asserting everything through HTTP |
+| Lifecycle | Explicit `start()`, not auto-start in constructor | Constructing an object should not bind a socket |
+| Test ports | Bind port `0`, read back `getPort()` | OS picks a free port — no conflicts between parallel runs |
+| Blocking a Jetty thread while long polling | Allowed, but capped at 20s | Simplest correct approach; the cap stops slow clients from starving the thread pool |
+| Reading the request body | `Content.Source.asString()` | A single `request.read()` returns only the chunk that happens to be available — not the whole body |
+| JSON | Hand-written parser, now with full escaping | Phase 3's regex-splitting parser broke on commas and quotes in payloads; Phase 4 replaces it with a real character scanner |
+
+### Try It
+
+```bash
+mvn compile exec:java
+
+curl -X POST localhost:8080/queues/orders
+curl -X POST localhost:8080/queues/orders/messages -d '{"payload":"Order #1, \"urgent\""}'
+curl localhost:8080/queues/orders/messages
+curl -X DELETE localhost:8080/queues/orders/messages/{receiptHandle}
+```
+
+---
+
 ## Getting Started
 
 **Prerequisites**
@@ -187,9 +243,9 @@ One JSON entry per line, append-only:
 mvn compile
 ```
 
-**Run**
+**Run** — starts the HTTP server on port 8080
 ```bash
-mvn compile exec:java -Dexec.mainClass="com.javaqueue.Main"
+mvn compile exec:java
 ```
 
 **Test**
@@ -208,7 +264,7 @@ MessageQueue queue = manager.createQueue("orders", config);
 ## Test Results
 
 ```
-Tests run: 49, Failures: 0, Errors: 0, Skipped: 0
+Tests run: 69, Failures: 0, Errors: 0, Skipped: 0
 
 ├── MessageTest                    4 tests  — value object correctness, concurrent ID uniqueness
 ├── MessageQueueTest               6 tests  — blocking consume, ACK, concurrent producers/consumers
@@ -216,14 +272,15 @@ Tests run: 49, Failures: 0, Errors: 0, Skipped: 0
 ├── DeliveryGuaranteesTest        10 tests  — timeout requeue, NACK, retry limit, DLQ, close()
 ├── WalTest                        5 tests  — WAL read/write/compact, all entry types round-trip
 ├── PersistenceTest                7 tests  — survive restart, compaction, retry count preserved
+├── QueueServerTest               20 tests  — full HTTP round-trip, long polling, status codes, routing
 ├── ConcurrentStressTest           3 tests  — 3.7M messages, sustained load, backlog draining
 └── DeliveryGuaranteesStressTest   4 tests  — concurrent NACKs, scanner + consumers, DLQ under load
 ```
 
 Stress test results (5 producers, 5 consumers, 3 seconds):
 ```
-Published: 2,631,944
-Consumed:  2,631,944
+Published: 5,093,389
+Consumed:  5,093,389
 ```
 
 ---
@@ -254,3 +311,11 @@ Consumed:  2,631,944
 - Crash recovery — replaying a log to reconstruct state
 - Why `notifyAll()` requires a monitor (`IllegalMonitorStateException`)
 - Hand-written serialization — understanding the format you depend on
+
+**Phase 4**
+- Timed waiting — `wait(timeout)` against a deadline, and why a bare timeout is wrong
+- Long polling as a latency/load trade-off, and what it costs in server threads
+- Thread pool starvation — why an uncapped server-side wait is a denial-of-service on yourself
+- Mapping queue semantics onto HTTP verbs and status codes (`204` for "nothing yet", not `200` with an empty body)
+- Streaming request bodies — why one `read()` is not the whole body
+- Writing a real character-scanning parser instead of splitting on delimiters
