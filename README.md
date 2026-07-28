@@ -40,7 +40,11 @@ javaqueue/
     │           │   ├── LogEntry.java          # Immutable WAL record with JSON serializer
     │           │   ├── LogOperation.java      # Enum: PUBLISH, CONSUME, ACK, NACK
     │           │   ├── WalWriter.java         # Append-only log file writer
-    │           │   └── WalReader.java         # Replays log on startup
+    │           │   ├── WalReader.java         # Replays log on startup
+    │           │   ├── Topic.java             # Named subscriber list; fan-out publish
+    │           │   ├── TopicManager.java      # Registry of topics; replays topic config
+    │           │   ├── TopicLog.java          # Persists SUBSCRIBE / UNSUBSCRIBE records
+    │           │   └── TopicOperation.java    # Enum: CREATE_TOPIC, DELETE_TOPIC, SUBSCRIBE, UNSUBSCRIBE
     │           ├── server/
     │           │   ├── QueueServer.java       # Jetty lifecycle — start, stop, bound port
     │           │   └── QueueHandler.java      # Routes HTTP requests onto the QueueManager
@@ -48,6 +52,7 @@ javaqueue/
     │           │   └── JsonUtils.java         # Hand-written flat JSON — shared by the WAL and the HTTP layer
     │           └── exception/
     │               ├── QueueNotFoundException.java
+    │               ├── TopicNotFoundException.java
     │               └── InvalidReceiptException.java
     └── test/
         └── java/
@@ -59,11 +64,15 @@ javaqueue/
                 │   ├── DeliveryGuaranteesTest.java
                 │   ├── LogEntryTest.java
                 │   ├── WalTest.java
-                │   └── PersistenceTest.java
+                │   ├── PersistenceTest.java
+                │   ├── TopicTest.java
+                │   ├── FanOutTest.java
+                │   └── TopicPersistenceTest.java
                 ├── json/
                 │   └── JsonUtilsTest.java
                 ├── server/
-                │   └── QueueServerTest.java
+                │   ├── QueueServerTest.java
+                │   └── TopicServerTest.java
                 └── concurrent/
                     ├── ConcurrentStressTest.java
                     └── DeliveryGuaranteesStressTest.java
@@ -79,7 +88,7 @@ javaqueue/
 | 2 | Delivery Guarantees | ✅ Complete | Visibility timeout, NACK, retry limit, dead letter queue |
 | 3 | Persistence | ✅ Complete | Write-ahead log — messages survive JVM restart |
 | 4 | Networking | ✅ Complete | HTTP API with long polling so external processes can connect |
-| 5 | Consumer Groups | 📋 Designed | SNS-style fan-out — a topic delivers to N subscriber queues |
+| 5 | Consumer Groups | ✅ Complete | SNS-style fan-out — a topic delivers to N subscriber queues |
 | 6 | Partitioned Log | ⏳ Planned | Kafka-style retained log with per-group offsets, retention, partitions |
 
 ---
@@ -224,6 +233,17 @@ This is backed by a new `MessageQueue.consume(long timeoutMs)`, which uses `wait
 | Reading the request body | `Content.Source.asString()` | A single `request.read()` returns only the chunk that happens to be available — not the whole body |
 | JSON | Hand-written parser, now with full escaping | Phase 3's regex-splitting parser broke on commas and quotes in payloads; Phase 4 replaces it with a real character scanner |
 
+### Try It
+
+```bash
+mvn compile exec:java
+
+curl -X POST localhost:8080/queues/orders
+curl -X POST localhost:8080/queues/orders/messages -d '{"payload":"Order #1, \"urgent\""}'
+curl localhost:8080/queues/orders/messages
+curl -X DELETE localhost:8080/queues/orders/messages/{receiptHandle}
+```
+
 ### Phase 4.1 — One Parser, Not Two
 
 Phase 4 fixed JSON escaping at the HTTP layer and left the WAL's own serializer untouched. That turned out to be the worst of both worlds: a payload like `Order #1, "urgent"` was accepted over HTTP, held correctly in memory, and then quietly destroyed on the way to disk.
@@ -269,15 +289,72 @@ The regression test uses `ThreadMXBean.findDeadlockedThreads()` rather than a ba
 
 **The lesson:** a lock protects *state*, not *operations*. Holding one across a call into another object's lock buys no atomicity that survives a crash — here it bought nothing at all, and cost a permanent hang.
 
+---
+
+## Phase 5 — Consumer Groups via Fan-Out
+
+### The Problem Phase 4 Left Open
+
+A message goes to exactly one consumer. If billing *and* analytics both need to see every order, there is no way to express that — a second consumer on the same queue competes for messages rather than receiving its own copy.
+
+### How It Works
+
+A **topic** is a named subscriber list. Publishing to it delivers the message into every subscriber's queue, and each subscriber consumes independently from there. This is SNS → SQS.
+
+**A consumer group is a subscriber queue.** Several consumers pulling from one subscriber queue compete for its messages — that is the group, and it already worked from Phase 1. Two subscriber queues on the same topic are two groups, each receiving everything.
+
+```
+                          ┌──► billing queue    ──► billing consumers   (group 1)
+publish ──► orders-events ─┤
+                          └──► analytics queue  ──► analytics consumers (group 2)
+```
+
+Nothing in `MessageQueue` changed. Every Phase 2 guarantee and Phase 3 persistence behaviour carries over untouched, because a subscriber queue *is* an ordinary queue.
+
+### Key Design Decisions
+
+| Problem | Approach | Why |
+|---------|----------|-----|
+| Copy the message per subscriber? | Share the one immutable instance | One payload in memory, and one logical id to correlate across groups. This is where Phase 1's immutability decision finally pays |
+| What does a subscription record? | The queue **name**, not the instance | Holding the instance pins one object — delete and recreate a queue and the topic would publish into the dead one, where messages are unreachable |
+| Queue ownership | Topics never own queues | Keeps the relationship many-to-many: a queue can subscribe to several topics, and unsubscribing detaches routing without touching the queue |
+| Fan-out atomicity | Independent, best-effort per subscriber | Matches SNS. The same message may be acknowledged on one subscriber and dead-lettered on another |
+| Subscribing an unregistered queue | Rejected at subscribe time | The alternative is a subscription that silently never delivers — fail where the mistake is |
+| Lock discipline | Resolve subscribers into a snapshot, then publish | Same rule Phase 4.2 established: never hold one queue's monitor while publishing to another |
+| Subscription durability | Logged to `_topics.log` | A topic whose subscriber list was lost still accepts publishes and delivers to nobody — a failure that looks perfectly healthy |
+
+### The Limitation That Defines It
+
+**A topic keeps no history.** A queue that subscribes later sees only messages published after it joined — there is nothing to backfill from. That is not an oversight; it is what separates fan-out from a log, and it is exactly what Phase 6 exists to fix.
+
+### API
+
+| Method | Path | Response |
+|---|---|---|
+| `GET` | `/topics` | `200` `{"topics":["orders-events"]}` |
+| `POST` | `/topics/{name}` | `201` `{"name":"orders-events"}` |
+| `DELETE` | `/topics/{name}` | `204`, `404` if absent |
+| `GET` | `/topics/{name}/subscriptions` | `200` `{"subscribers":["billing"]}` |
+| `POST` | `/topics/{name}/subscriptions/{queue}` | `201`, `404` if topic or queue absent |
+| `DELETE` | `/topics/{name}/subscriptions/{queue}` | `204` |
+| `POST` | `/topics/{name}/messages` | `201` `{"messageId":"42","delivered":"2"}` |
+
+There is deliberately **no** `GET /topics/{name}/messages` — it returns `405`, not `404`. The path exists; the operation does not. You consume from a subscriber queue, never from the topic. Making that impossible in the API is the clearest way to say that a topic routes rather than stores.
+
 ### Try It
 
 ```bash
-mvn compile exec:java
+curl -X POST localhost:8080/topics/orders-events
+curl -X POST localhost:8080/queues/billing
+curl -X POST localhost:8080/queues/analytics
+curl -X POST localhost:8080/topics/orders-events/subscriptions/billing
+curl -X POST localhost:8080/topics/orders-events/subscriptions/analytics
 
-curl -X POST localhost:8080/queues/orders
-curl -X POST localhost:8080/queues/orders/messages -d '{"payload":"Order #1, \"urgent\""}'
-curl localhost:8080/queues/orders/messages
-curl -X DELETE localhost:8080/queues/orders/messages/{receiptHandle}
+curl -X POST localhost:8080/topics/orders-events/messages -d '{"payload":"Order #1"}'
+# {"messageId":"0","delivered":"2"}
+
+curl localhost:8080/queues/billing/messages     # same messageId,
+curl localhost:8080/queues/analytics/messages   # different receiptHandle
 ```
 
 ---
@@ -314,7 +391,7 @@ MessageQueue queue = manager.createQueue("orders", config);
 ## Test Results
 
 ```
-Tests run: 129, Failures: 0, Errors: 0, Skipped: 0
+Tests run: 196, Failures: 0, Errors: 0, Skipped: 0
 
 ├── MessageTest                    4 tests  — value object correctness, concurrent ID uniqueness
 ├── MessageQueueTest              12 tests  — blocking consume, timed consume, ACK, concurrency
@@ -324,7 +401,11 @@ Tests run: 129, Failures: 0, Errors: 0, Skipped: 0
 ├── WalTest                       10 tests  — read/write/compact, torn writes, punctuated payloads
 ├── PersistenceTest               11 tests  — survive restart, compaction, retry count preserved
 ├── JsonUtilsTest                 25 tests  — parser round-trips, escapes, malformed input rejection
+├── TopicTest                     17 tests  — registry, subscription lifecycle, ownership boundary
+├── FanOutTest                    18 tests  — delivery to N groups, no backfill, DLQ independence
+├── TopicPersistenceTest          12 tests  — subscriptions survive restart, compaction, torn writes
 ├── QueueServerTest               20 tests  — full HTTP round-trip, long polling, status codes, routing
+├── TopicServerTest               20 tests  — topic endpoints, fan-out over HTTP, the 405 asymmetry
 ├── ConcurrentStressTest           3 tests  — 5.1M messages, sustained load, backlog draining
 └── DeliveryGuaranteesStressTest   5 tests  — concurrent NACKs, scanner + consumers, DLQ cycles
 ```
@@ -377,3 +458,10 @@ Consumed:  5,093,389
 - Lock ordering, and why an AB–BA cycle is a permanent hang rather than a slowdown
 - Detecting deadlock programmatically with `ThreadMXBean.findDeadlockedThreads()`
 - That a lock protects state, not operations — holding one across a call into another object's lock buys no crash-atomicity
+
+**Phase 5**
+- Fan-out versus a shared log — two ways to build consumer groups, and what each one cannot do
+- Why immutability lets N consumers share one object instead of N copies
+- Binding by name rather than by reference, and the stale-reference bug that motivates it
+- Persisting configuration, not just data — a lost subscriber list fails silently while looking healthy
+- Modelling an operation's absence in the API (405, not 404) as a design statement
