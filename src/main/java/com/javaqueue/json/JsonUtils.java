@@ -1,4 +1,4 @@
-package com.javaqueue.server;
+package com.javaqueue.json;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -6,12 +6,17 @@ import java.util.Map;
 /**
  * Hand-written JSON for flat, single-level objects.
  *
- * Same philosophy as the WAL: no Jackson, no Gson. Writing the parser by hand
- * is the point — it forces you to deal with quoting, escaping, and the fact
- * that you cannot split a JSON document on commas and hope for the best.
+ * No Jackson, no Gson. Writing the parser by hand is the point — it forces you
+ * to deal with quoting, escaping, and the fact that you cannot split a JSON
+ * document on commas and hope for the best.
  *
  * Supports: string values, numbers, booleans, null. Not supported: nesting,
  * arrays. Those are rejected rather than silently mangled.
+ *
+ * Lives in its own package because two layers depend on it: the write-ahead
+ * log in {@code core} and the HTTP API in {@code server}. They used to have
+ * separate implementations, and the WAL's could not survive a quote or a
+ * comma in a payload.
  */
 public class JsonUtils {
 
@@ -92,8 +97,12 @@ public class JsonUtils {
         return "{\"error\":\"" + escape(message) + "\"}";
     }
 
-    // Escapes a string for inclusion inside JSON double quotes.
-    static String escape(String raw) {
+    /**
+     * Escapes a string for inclusion inside JSON double quotes. Public because
+     * LogEntry builds its own object literal to keep numeric fields unquoted,
+     * preserving the on-disk WAL format.
+     */
+    public static String escape(String raw) {
         StringBuilder sb = new StringBuilder(raw.length() + 8);
         for (int i = 0; i < raw.length(); i++) {
             char ch = raw.charAt(i);

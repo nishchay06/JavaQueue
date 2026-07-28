@@ -1,5 +1,9 @@
 package com.javaqueue.core;
 
+import java.util.Map;
+
+import com.javaqueue.json.JsonUtils;
+
 public class LogEntry {
 
     private final LogOperation op;
@@ -11,12 +15,19 @@ public class LogEntry {
 
     private LogEntry(LogOperation op, String msgId, String payload,
             String handle, int retryCount) {
+        this(op, msgId, payload, handle, retryCount, System.currentTimeMillis());
+    }
+
+    // Replay constructor — keeps the timestamp the entry was written with
+    // rather than stamping it with the time of the restart.
+    private LogEntry(LogOperation op, String msgId, String payload,
+            String handle, int retryCount, long timestamp) {
         this.op = op;
         this.msgId = msgId;
         this.payload = payload;
         this.handle = handle;
         this.retryCount = retryCount;
-        this.timestamp = System.currentTimeMillis();
+        this.timestamp = timestamp;
     }
 
     public static LogEntry publish(Message message) {
@@ -37,53 +48,51 @@ public class LogEntry {
         return new LogEntry(LogOperation.NACK, null, null, handle, 0);
     }
 
+    // The object literal is built by hand rather than via JsonUtils.toJson so
+    // that retryCount and ts stay unquoted numbers — that keeps the on-disk
+    // format identical to what Phase 3 wrote, so existing logs still replay.
+    // Every string field goes through JsonUtils.escape().
     public String toJson() {
-        return String.format(
-                "{\"op\":\"%s\",\"msgId\":\"%s\",\"payload\":\"%s\",\"handle\":\"%s\",\"retryCount\":%d,\"ts\":%d}",
-                op,
-                msgId != null ? msgId : "",
-                payload != null ? payload : "",
-                handle != null ? handle : "",
-                retryCount,
-                timestamp);
+        return "{\"op\":\"" + op + "\""
+                + ",\"msgId\":" + quoted(msgId)
+                + ",\"payload\":" + quoted(payload)
+                + ",\"handle\":" + quoted(handle)
+                + ",\"retryCount\":" + retryCount
+                + ",\"ts\":" + timestamp
+                + "}";
     }
 
-    // Extracts value for a given key from a flat JSON string.
-    // Works for our controlled format — not a general JSON parser.
-    private static String extractField(String json, String key) {
-        String search = "\"" + key + "\":";
-        int start = json.indexOf(search);
-        if (start == -1)
-            return "";
-        start += search.length();
-
-        if (json.charAt(start) == '"') {
-            // String value
-            start++;
-            int end = json.indexOf('"', start);
-            return json.substring(start, end);
-        } else {
-            // Numeric value
-            int end = json.indexOf(',', start);
-            if (end == -1)
-                end = json.indexOf('}', start);
-            return json.substring(start, end).trim();
-        }
+    // A field that does not apply to this operation is written as JSON null,
+    // which keeps it distinguishable from a genuinely empty payload.
+    private static String quoted(String value) {
+        return value == null ? "null" : "\"" + JsonUtils.escape(value) + "\"";
     }
 
     public static LogEntry fromJson(String line) {
-        String op = extractField(line, "op");
-        String msgId = extractField(line, "msgId");
-        String payload = extractField(line, "payload");
-        String handle = extractField(line, "handle");
-        int retryCount = Integer.parseInt(extractField(line, "retryCount"));
+        Map<String, String> fields = JsonUtils.fromJson(line);
+
+        String op = fields.get("op");
+        if (op == null) {
+            throw new IllegalArgumentException("WAL entry has no 'op' field: " + line);
+        }
 
         return new LogEntry(
                 LogOperation.valueOf(op),
-                msgId.isEmpty() ? null : msgId,
-                payload.isEmpty() ? null : payload,
-                handle.isEmpty() ? null : handle,
-                retryCount);
+                fields.get("msgId"),
+                fields.get("payload"),
+                fields.get("handle"),
+                intField(fields, "retryCount"),
+                longField(fields, "ts"));
+    }
+
+    private static int intField(Map<String, String> fields, String key) {
+        String value = fields.get(key);
+        return value == null ? 0 : Integer.parseInt(value);
+    }
+
+    private static long longField(Map<String, String> fields, String key) {
+        String value = fields.get(key);
+        return value == null ? System.currentTimeMillis() : Long.parseLong(value);
     }
 
     public LogOperation getOp() {

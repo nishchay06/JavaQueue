@@ -13,7 +13,10 @@ import java.util.concurrent.TimeoutException;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -154,5 +157,115 @@ public class MessageQueueTest {
 
         // Every message received exactly once — no duplicates, no misses
         assertEquals(totalMessages, received.size());
+    }
+
+    // ─── Test 7: Timed consume returns immediately when a message is ready ───
+    @Test
+    void testTimedConsumeReturnsAvailableMessageImmediately() throws InterruptedException {
+        queue.publish(new Message("hello"));
+
+        long start = System.currentTimeMillis();
+        Receipt receipt = queue.consume(5000);
+        long elapsed = System.currentTimeMillis() - start;
+
+        assertNotNull(receipt);
+        assertEquals("hello", receipt.getMessage().getPayload());
+        assertTrue(elapsed < 500, "should not have waited at all, waited " + elapsed + "ms");
+    }
+
+    // ─── Test 8: Timed consume returns null once the deadline passes ─────────
+    @Test
+    void testTimedConsumeReturnsNullOnTimeout() throws InterruptedException {
+        long start = System.currentTimeMillis();
+        Receipt receipt = queue.consume(300);
+        long elapsed = System.currentTimeMillis() - start;
+
+        assertNull(receipt, "empty queue should yield null, not block forever");
+        assertTrue(elapsed >= 250, "should have waited out the timeout, waited " + elapsed + "ms");
+    }
+
+    // ─── Test 9: Zero timeout is a non-blocking poll ─────────────────────────
+    @Test
+    void testTimedConsumeWithZeroTimeoutDoesNotBlock() throws InterruptedException {
+        long start = System.currentTimeMillis();
+        Receipt receipt = queue.consume(0);
+        long elapsed = System.currentTimeMillis() - start;
+
+        assertNull(receipt);
+        assertTrue(elapsed < 200, "zero timeout should return at once, took " + elapsed + "ms");
+    }
+
+    // ─── Test 10: Timed consume wakes as soon as a message is published ──────
+    @Test
+    void testTimedConsumeWakesOnPublish() throws InterruptedException {
+        Thread producer = new Thread(() -> {
+            try {
+                Thread.sleep(200);
+                queue.publish(new Message("late"));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        producer.start();
+
+        long start = System.currentTimeMillis();
+        Receipt receipt = queue.consume(10_000);
+        long elapsed = System.currentTimeMillis() - start;
+        producer.join();
+
+        assertNotNull(receipt);
+        assertEquals("late", receipt.getMessage().getPayload());
+        assertTrue(elapsed < 3000, "should have woken on publish, took " + elapsed + "ms");
+    }
+
+    // ─── Test 11: A losing consumer does not get its deadline extended ───────
+    // Two consumers wait on one message. The loser must still time out on the
+    // original deadline — this is what a bare wait(timeoutMs) would get wrong,
+    // since being woken and losing the race would restart its full timeout.
+    @Test
+    void testTimedConsumeDeadlineIsNotResetByLostRace() throws Exception {
+        long timeoutMs = 600;
+
+        CompletableFuture<Long> loserElapsed = new CompletableFuture<>();
+        Runnable consumer = () -> {
+            long start = System.currentTimeMillis();
+            try {
+                Receipt r = queue.consume(timeoutMs);
+                if (r == null) {
+                    loserElapsed.complete(System.currentTimeMillis() - start);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        };
+
+        Thread c1 = new Thread(consumer);
+        Thread c2 = new Thread(consumer);
+        c1.start();
+        c2.start();
+
+        // One message, two waiters — exactly one of them loses the race.
+        Thread.sleep(150);
+        queue.publish(new Message("only-one"));
+
+        long elapsed = loserElapsed.get(5, TimeUnit.SECONDS);
+        c1.join();
+        c2.join();
+
+        assertTrue(elapsed < timeoutMs * 2,
+                "loser's deadline was reset by the wakeup — waited " + elapsed
+                        + "ms against a " + timeoutMs + "ms timeout");
+    }
+
+    // ─── Test 12: Timed consume tracks in-flight state like consume() ────────
+    @Test
+    void testTimedConsumeRegistersInFlight() throws InterruptedException {
+        queue.publish(new Message("hello"));
+
+        Receipt receipt = queue.consume(1000);
+
+        assertEquals(1, queue.inFlightMessages.size());
+        queue.acknowledge(receipt.getReceiptHandle());
+        assertEquals(0, queue.inFlightMessages.size());
     }
 }
