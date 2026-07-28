@@ -18,6 +18,7 @@ import com.javaqueue.core.QueueManager;
 import com.javaqueue.core.Receipt;
 import com.javaqueue.exception.InvalidReceiptException;
 import com.javaqueue.exception.QueueNotFoundException;
+import com.javaqueue.json.JsonUtils;
 
 /**
  * Routes HTTP requests onto the QueueManager.

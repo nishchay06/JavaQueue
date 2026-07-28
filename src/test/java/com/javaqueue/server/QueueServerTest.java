@@ -18,6 +18,7 @@ import org.junit.jupiter.api.Test;
 
 import com.javaqueue.core.Message;
 import com.javaqueue.core.QueueManager;
+import com.javaqueue.json.JsonUtils;
 
 /**
  * End-to-end tests over real HTTP — a real socket, a real Jetty, a real client.

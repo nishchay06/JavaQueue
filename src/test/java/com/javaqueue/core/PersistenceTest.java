@@ -10,6 +10,7 @@ import java.nio.file.Path;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class PersistenceTest {
 
@@ -188,5 +189,76 @@ public class PersistenceTest {
         // No log file should have been created
         Path logFile = tempDir.resolve("orders.log");
         assertFalse(Files.exists(logFile), "No log file should be created without logDirectory");
+    }
+
+    // ── Test 8: Log file is actually created when persistence is on ───────────
+    @Test
+    void testLogFileCreatedWhenLogDirectoryConfigured() {
+        QueueConfig config = new QueueConfig(30_000, 3, null, logDir);
+        MessageQueue queue = new MessageQueue("orders", config, 1000);
+
+        queue.publish(new Message("Order1"));
+        queue.close();
+
+        assertTrue(Files.exists(tempDir.resolve("orders.log")),
+                "a queue configured with logDirectory should create {name}.log");
+    }
+
+    // ── Test 9: Punctuated payload survives a restart ─────────────────────────
+    // The end-to-end version of the LogEntry escaping bug: the payload is fine
+    // in memory, and only corrupts once it has been through the log.
+    @Test
+    void testPunctuatedPayloadSurvivesRestart() throws InterruptedException {
+        QueueConfig config = new QueueConfig(30_000, 3, null, logDir);
+        MessageQueue queue = new MessageQueue("orders", config, 1000);
+
+        String payload = "Order #1, \"urgent\"";
+        queue.publish(new Message(payload));
+        queue.close();
+
+        MessageQueue restarted = restart("orders");
+        Receipt receipt = restarted.consume();
+
+        assertEquals(payload, receipt.getMessage().getPayload());
+        restarted.close();
+    }
+
+    // ── Test 10: Multiline payload survives a restart ─────────────────────────
+    @Test
+    void testMultilinePayloadSurvivesRestart() throws InterruptedException {
+        QueueConfig config = new QueueConfig(30_000, 3, null, logDir);
+        MessageQueue queue = new MessageQueue("orders", config, 1000);
+
+        String payload = "subject: shipping\n\nbody line";
+        queue.publish(new Message(payload));
+        queue.publish(new Message("second"));
+        queue.close();
+
+        MessageQueue restarted = restart("orders");
+
+        assertEquals(payload, restarted.consume().getMessage().getPayload());
+        assertEquals("second", restarted.consume().getMessage().getPayload());
+        restarted.close();
+    }
+
+    // ── Test 11: A punctuated payload does not corrupt entries after it ───────
+    // The real damage is collateral: one bad record desynchronises replay for
+    // every message written after it.
+    @Test
+    void testPunctuatedPayloadDoesNotCorruptLaterMessages() throws InterruptedException {
+        QueueConfig config = new QueueConfig(30_000, 3, null, logDir);
+        MessageQueue queue = new MessageQueue("orders", config, 1000);
+
+        queue.publish(new Message("before"));
+        queue.publish(new Message("bad, \"payload\"\nwith newline"));
+        queue.publish(new Message("after"));
+        queue.close();
+
+        MessageQueue restarted = restart("orders");
+
+        assertEquals("before", restarted.consume().getMessage().getPayload());
+        assertEquals("bad, \"payload\"\nwith newline", restarted.consume().getMessage().getPayload());
+        assertEquals("after", restarted.consume().getMessage().getPayload());
+        restarted.close();
     }
 }

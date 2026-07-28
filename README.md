@@ -43,8 +43,9 @@ javaqueue/
     │           │   └── WalReader.java         # Replays log on startup
     │           ├── server/
     │           │   ├── QueueServer.java       # Jetty lifecycle — start, stop, bound port
-    │           │   ├── QueueHandler.java      # Routes HTTP requests onto the QueueManager
-    │           │   └── JsonUtils.java         # Hand-written flat JSON parser and serializer
+    │           │   └── QueueHandler.java      # Routes HTTP requests onto the QueueManager
+    │           ├── json/
+    │           │   └── JsonUtils.java         # Hand-written flat JSON — shared by the WAL and the HTTP layer
     │           └── exception/
     │               ├── QueueNotFoundException.java
     │               └── InvalidReceiptException.java
@@ -56,8 +57,11 @@ javaqueue/
                 │   ├── MessageQueueTest.java
                 │   ├── QueueManagerTest.java
                 │   ├── DeliveryGuaranteesTest.java
+                │   ├── LogEntryTest.java
                 │   ├── WalTest.java
                 │   └── PersistenceTest.java
+                ├── json/
+                │   └── JsonUtilsTest.java
                 ├── server/
                 │   └── QueueServerTest.java
                 └── concurrent/
@@ -219,6 +223,24 @@ This is backed by a new `MessageQueue.consume(long timeoutMs)`, which uses `wait
 | Reading the request body | `Content.Source.asString()` | A single `request.read()` returns only the chunk that happens to be available — not the whole body |
 | JSON | Hand-written parser, now with full escaping | Phase 3's regex-splitting parser broke on commas and quotes in payloads; Phase 4 replaces it with a real character scanner |
 
+### Phase 4.1 — One Parser, Not Two
+
+Phase 4 fixed JSON escaping at the HTTP layer and left the WAL's own serializer untouched. That turned out to be the worst of both worlds: a payload like `Order #1, "urgent"` was accepted over HTTP, held correctly in memory, and then quietly destroyed on the way to disk.
+
+Three failure modes, each pinned by a test before anything was changed:
+
+| Payload | Replayed as | Cause |
+|---------|-------------|-------|
+| `Order #1, "urgent"` | `Order #1,` | Unescaped quote ended the field early |
+| `line one\nline two` | split across two records | The log is line-delimited; a raw newline desynchronises everything after it |
+| `","handle":"spoofed","retryCount":99,"x":"` | `handle=spoofed`, `retryCount=99` | A payload could forge its own log metadata |
+
+Two further bugs surfaced during the fix: `fromJson()` never restored the `ts` field, so every replayed entry was re-stamped with the restart time; and `payload.isEmpty() ? null : payload` collapsed an empty payload into null, making it indistinguishable from "this field does not apply to this operation".
+
+The fix was to stop having two parsers. `JsonUtils` moved into its own `com.javaqueue.json` package that both `core` and `server` depend on. `LogEntry` still hand-builds its object literal so `retryCount` and `ts` stay unquoted numbers — which keeps the on-disk format byte-compatible with logs written by Phase 3.
+
+**The lesson:** the duplicate implementation *was* the bug. Two parsers for one format means one of them is always the stale one, and the format's invariants only hold where somebody remembered to enforce them.
+
 ### Try It
 
 ```bash
@@ -264,16 +286,18 @@ MessageQueue queue = manager.createQueue("orders", config);
 ## Test Results
 
 ```
-Tests run: 69, Failures: 0, Errors: 0, Skipped: 0
+Tests run: 128, Failures: 0, Errors: 0, Skipped: 0
 
 ├── MessageTest                    4 tests  — value object correctness, concurrent ID uniqueness
-├── MessageQueueTest               6 tests  — blocking consume, ACK, concurrent producers/consumers
+├── MessageQueueTest              12 tests  — blocking consume, timed consume, ACK, concurrency
 ├── QueueManagerTest              10 tests  — create, delete, config, DLQ wiring, scanner shutdown
 ├── DeliveryGuaranteesTest        10 tests  — timeout requeue, NACK, retry limit, DLQ, close()
-├── WalTest                        5 tests  — WAL read/write/compact, all entry types round-trip
-├── PersistenceTest                7 tests  — survive restart, compaction, retry count preserved
+├── LogEntryTest                  19 tests  — WAL record escaping, field spoofing, legacy format
+├── WalTest                       10 tests  — read/write/compact, torn writes, punctuated payloads
+├── PersistenceTest               11 tests  — survive restart, compaction, retry count preserved
+├── JsonUtilsTest                 25 tests  — parser round-trips, escapes, malformed input rejection
 ├── QueueServerTest               20 tests  — full HTTP round-trip, long polling, status codes, routing
-├── ConcurrentStressTest           3 tests  — 3.7M messages, sustained load, backlog draining
+├── ConcurrentStressTest           3 tests  — 5.1M messages, sustained load, backlog draining
 └── DeliveryGuaranteesStressTest   4 tests  — concurrent NACKs, scanner + consumers, DLQ under load
 ```
 
@@ -319,3 +343,6 @@ Consumed:  5,093,389
 - Mapping queue semantics onto HTTP verbs and status codes (`204` for "nothing yet", not `200` with an empty body)
 - Streaming request bodies — why one `read()` is not the whole body
 - Writing a real character-scanning parser instead of splitting on delimiters
+- Escaping as a correctness boundary — unescaped input in a structured format is an injection bug, not a formatting one
+- Why a duplicated implementation of one format is itself the defect
+- Evolving a persisted format without breaking files already on disk
