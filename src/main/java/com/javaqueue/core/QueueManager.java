@@ -12,24 +12,59 @@ public class QueueManager {
     // atomic put/get/remove operations across threads.
     private final ConcurrentHashMap<String, MessageQueue> queues = new ConcurrentHashMap<>();
 
+    /**
+     * Applied to queues created without an explicit logDirectory. Null means
+     * no persistence, which is the historical behaviour.
+     *
+     * Durability used to be strictly per-queue, so a queue created without one
+     * — over HTTP, or as an auto-created DLQ — silently lost its messages on
+     * restart. A default here makes persistence a property of the deployment
+     * instead of something every caller has to remember.
+     */
+    private final String defaultLogDirectory;
+
+    public QueueManager() {
+        this(null);
+    }
+
+    public QueueManager(String defaultLogDirectory) {
+        this.defaultLogDirectory = defaultLogDirectory;
+    }
+
     public MessageQueue createQueue(String name) {
         return createQueue(name, QueueConfig.defaults());
     }
 
     public MessageQueue createQueue(String name, QueueConfig config) {
+        QueueConfig effective = applyDefaultLogDirectory(config);
+
         // computeIfAbsent is atomic — if two threads call createQueue("orders")
         // simultaneously, only one MessageQueue is created. Not two.
         MessageQueue queue = queues.computeIfAbsent(name,
-                n -> new MessageQueue(n, config));
+                n -> new MessageQueue(n, effective));
 
         String dlqName = config.getDeadLetterQueueName();
         if (dlqName != null) {
+            // The DLQ gets the default too. A dead letter queue that loses its
+            // contents on restart defeats the point of having one.
             MessageQueue dlq = queues.computeIfAbsent(dlqName,
-                    n -> new MessageQueue(n, QueueConfig.defaults()));
+                    n -> new MessageQueue(n, applyDefaultLogDirectory(QueueConfig.defaults())));
             queue.setDeadLetterQueue(dlq);
         }
 
         return queue;
+    }
+
+    // An explicit logDirectory is a deliberate override and always wins.
+    private QueueConfig applyDefaultLogDirectory(QueueConfig config) {
+        if (defaultLogDirectory == null || config.getLogDirectory() != null) {
+            return config;
+        }
+        return new QueueConfig(
+                config.getVisibilityTimeoutMs(),
+                config.getMaxRetries(),
+                config.getDeadLetterQueueName(),
+                defaultLogDirectory);
     }
 
     public MessageQueue getQueue(String name) {
