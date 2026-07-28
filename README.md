@@ -79,7 +79,8 @@ javaqueue/
 | 2 | Delivery Guarantees | ✅ Complete | Visibility timeout, NACK, retry limit, dead letter queue |
 | 3 | Persistence | ✅ Complete | Write-ahead log — messages survive JVM restart |
 | 4 | Networking | ✅ Complete | HTTP API with long polling so external processes can connect |
-| 5 | Consumer Groups | ⏳ Planned | Kafka-style groups with per-group offsets |
+| 5 | Consumer Groups | 📋 Designed | SNS-style fan-out — a topic delivers to N subscriber queues |
+| 6 | Partitioned Log | ⏳ Planned | Kafka-style retained log with per-group offsets, retention, partitions |
 
 ---
 
@@ -241,6 +242,33 @@ The fix was to stop having two parsers. `JsonUtils` moved into its own `com.java
 
 **The lesson:** the duplicate implementation *was* the bug. Two parsers for one format means one of them is always the stale one, and the format's invariants only hold where somebody remembered to enforce them.
 
+### Phase 4.2 — The Dead Letter Deadlock
+
+Found while designing Phase 5, in code that had been shipped since Phase 2 and passed every test.
+
+`requeueOrDeadLetter()` published to the dead letter queue from *inside* `synchronized(this)` — holding lock A while acquiring lock B. That is safe only while every thread acquires the two locks in the same order, and two queues configured as each other's DLQ make that impossible:
+
+```
+Thread 1: nack on A → holds A, wants B
+Thread 2: nack on B → holds B, wants A
+```
+
+Both hang forever. No timeout, no recovery. The test output showed it reached further than the two nacking threads:
+
+```
+scanner-cycle-a blocked on A held by dlq-cycle-a
+dlq-cycle-a     blocked on B held by dlq-cycle-b
+dlq-cycle-b     blocked on A held by dlq-cycle-a
+```
+
+The visibility scanner joins the cycle, so timeout recovery for that queue stops too — every in-flight message on it silently stops being redelivered.
+
+The fix is to stop holding two locks at once rather than to order them. `requeueOrDeadLetter()` now *returns* the message that must leave, and the caller publishes it after releasing the monitor. Because the nested acquisition is gone entirely, cycle length is irrelevant — 2-queue, 3-queue, and self-cycle configurations are all verified.
+
+The regression test uses `ThreadMXBean.findDeadlockedThreads()` rather than a bare timeout, so a future regression names the threads and monitors instead of hanging the build with no explanation.
+
+**The lesson:** a lock protects *state*, not *operations*. Holding one across a call into another object's lock buys no atomicity that survives a crash — here it bought nothing at all, and cost a permanent hang.
+
 ### Try It
 
 ```bash
@@ -286,7 +314,7 @@ MessageQueue queue = manager.createQueue("orders", config);
 ## Test Results
 
 ```
-Tests run: 128, Failures: 0, Errors: 0, Skipped: 0
+Tests run: 129, Failures: 0, Errors: 0, Skipped: 0
 
 ├── MessageTest                    4 tests  — value object correctness, concurrent ID uniqueness
 ├── MessageQueueTest              12 tests  — blocking consume, timed consume, ACK, concurrency
@@ -298,7 +326,7 @@ Tests run: 128, Failures: 0, Errors: 0, Skipped: 0
 ├── JsonUtilsTest                 25 tests  — parser round-trips, escapes, malformed input rejection
 ├── QueueServerTest               20 tests  — full HTTP round-trip, long polling, status codes, routing
 ├── ConcurrentStressTest           3 tests  — 5.1M messages, sustained load, backlog draining
-└── DeliveryGuaranteesStressTest   4 tests  — concurrent NACKs, scanner + consumers, DLQ under load
+└── DeliveryGuaranteesStressTest   5 tests  — concurrent NACKs, scanner + consumers, DLQ cycles
 ```
 
 Stress test results (5 producers, 5 consumers, 3 seconds):
@@ -346,3 +374,6 @@ Consumed:  5,093,389
 - Escaping as a correctness boundary — unescaped input in a structured format is an injection bug, not a formatting one
 - Why a duplicated implementation of one format is itself the defect
 - Evolving a persisted format without breaking files already on disk
+- Lock ordering, and why an AB–BA cycle is a permanent hang rather than a slowdown
+- Detecting deadlock programmatically with `ThreadMXBean.findDeadlockedThreads()`
+- That a lock protects state, not operations — holding one across a call into another object's lock buys no crash-atomicity
