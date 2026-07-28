@@ -16,7 +16,11 @@ public class MessageQueue {
     public final String name;
 
     private final QueueConfig config;
-    private MessageQueue deadLetterQueue;
+
+    // volatile: written by whoever wires the queue up (QueueManager, on some
+    // other thread) and read by consumers and the scanner.
+    private volatile MessageQueue deadLetterQueue;
+
     private final Thread scannerThread;
 
     // Tracks retry count per message ID across requeues
@@ -46,13 +50,14 @@ public class MessageQueue {
         this.config = config;
         // Initialize WAL if persistence is configured
         WalWriter writer = null;
+        List<Message> departing = List.of();
         if (config.getLogDirectory() != null) {
             try {
                 Path logFile = Path.of(config.getLogDirectory(), name + ".log");
                 List<LogEntry> entries = WalReader.read(logFile);
                 if (!entries.isEmpty()) {
                     synchronized (this) {
-                        replay(entries);
+                        departing = replay(entries);
                     }
                 }
                 writer = new WalWriter(logFile);
@@ -65,6 +70,7 @@ public class MessageQueue {
             }
         }
         this.walWriter = writer;
+        flushToDeadLetterQueue(deadLetterQueue, departing);
 
         VisibilityScanner scanner = new VisibilityScanner(this, scanIntervalMs);
         this.scannerThread = new Thread(scanner, "scanner-" + name);
@@ -187,25 +193,65 @@ public class MessageQueue {
         this.deadLetterQueue = dlq;
     }
 
-    private void requeueOrDeadLetter(Message message, int newRetryCount) {
-        if (newRetryCount >= config.getMaxRetries()) {
-            retryCounts.remove(message.getId());
-            if (deadLetterQueue != null) {
-                deadLetterQueue.publish(message);
-            } else {
-                System.err.println("WARNING: Message " + message.getId()
-                        + " exceeded max retries and has been dropped from queue '"
-                        + name + "'");
-            }
-        } else {
+    /**
+     * Either requeues the message here, or reports that it must leave for the
+     * dead letter queue.
+     *
+     * Caller MUST hold this queue's monitor. The DLQ publish is deliberately
+     * NOT done here: publishing takes the DLQ's monitor, and doing that while
+     * still holding this one means a thread holds lock A while acquiring lock
+     * B. That is only safe if every thread acquires them in the same order,
+     * and two queues configured as each other's DLQ make that impossible —
+     * one thread goes A then B, the other B then A, and both hang forever.
+     *
+     * So the message is handed back instead, and the caller publishes it once
+     * it has released this monitor. See flushToDeadLetterQueue.
+     *
+     * @return the message to publish to the DLQ, or null if nothing leaves
+     */
+    private Message requeueOrDeadLetter(Message message, int newRetryCount) {
+        if (newRetryCount < config.getMaxRetries()) {
             retryCounts.put(message.getId(), newRetryCount);
             messages.add(message);
             notifyAll();
+            return null;
+        }
+
+        retryCounts.remove(message.getId());
+
+        if (deadLetterQueue == null) {
+            System.err.println("WARNING: Message " + message.getId()
+                    + " exceeded max retries and has been dropped from queue '"
+                    + name + "'");
+            return null;
+        }
+        return message;
+    }
+
+    /**
+     * Publishes messages that have left this queue for its DLQ.
+     *
+     * MUST be called with this queue's monitor released. The window between
+     * removing the message here and it landing in the DLQ is not atomic, which
+     * is fine: the queue is at-least-once, and the DLQ writes its own WAL entry
+     * on arrival. Holding the lock across the publish would not have made it
+     * crash-atomic anyway — it would only have added the deadlock.
+     */
+    private void flushToDeadLetterQueue(MessageQueue dlq, List<Message> departing) {
+        if (dlq == null) {
+            return;
+        }
+        for (Message message : departing) {
+            dlq.publish(message);
         }
     }
 
     public void scanAndRequeue() {
+        List<Message> departing = new ArrayList<>();
+        MessageQueue dlq;
+
         synchronized (this) {
+            dlq = deadLetterQueue;
             inFlightMessages.entrySet().stream()
                     .filter(e -> e.getValue().isTimedOut(config.getVisibilityTimeoutMs()))
                     .map(Map.Entry::getKey)
@@ -213,13 +259,23 @@ public class MessageQueue {
                               // ConcurrentModificationException
                     .forEach(handle -> {
                         InFlightEntry entry = inFlightMessages.remove(handle);
-                        requeueOrDeadLetter(entry.getMessage(), entry.getRetryCount() + 1);
+                        Message leaving = requeueOrDeadLetter(entry.getMessage(),
+                                entry.getRetryCount() + 1);
+                        if (leaving != null) {
+                            departing.add(leaving);
+                        }
                     });
         }
+
+        flushToDeadLetterQueue(dlq, departing);
     }
 
     public void nack(String receiptHandle) {
+        List<Message> departing = new ArrayList<>();
+        MessageQueue dlq;
+
         synchronized (this) {
+            dlq = deadLetterQueue;
             InFlightEntry entry = inFlightMessages.remove(receiptHandle);
             if (entry == null) {
                 throw new InvalidReceiptException(receiptHandle);
@@ -233,15 +289,26 @@ public class MessageQueue {
                 }
             }
 
-            requeueOrDeadLetter(entry.getMessage(), entry.getRetryCount() + 1);
+            Message leaving = requeueOrDeadLetter(entry.getMessage(), entry.getRetryCount() + 1);
+            if (leaving != null) {
+                departing.add(leaving);
+            }
         }
+
+        flushToDeadLetterQueue(dlq, departing);
     }
 
     public String getName() {
         return name;
     }
 
-    private void replay(List<LogEntry> entries) {
+    // Returns messages bound for the DLQ, to be published by the caller once
+    // this queue's monitor is released — same contract as requeueOrDeadLetter.
+    // In practice this is always empty during construction, since the DLQ is
+    // wired up by QueueManager after the constructor returns.
+    private List<Message> replay(List<LogEntry> entries) {
+        List<Message> departing = new ArrayList<>();
+
         for (LogEntry entry : entries) {
             switch (entry.getOp()) {
                 case PUBLISH -> {
@@ -275,8 +342,11 @@ public class MessageQueue {
                     // Message was NACKed — remove from in-flight and requeue
                     InFlightEntry removed = inFlightMessages.remove(entry.getHandle());
                     if (removed != null) {
-                        requeueOrDeadLetter(removed.getMessage(),
+                        Message leaving = requeueOrDeadLetter(removed.getMessage(),
                                 removed.getRetryCount() + 1);
+                        if (leaving != null) {
+                            departing.add(leaving);
+                        }
                     }
                 }
             }
@@ -287,9 +357,14 @@ public class MessageQueue {
         new ArrayList<>(inFlightMessages.entrySet())
                 .forEach(e -> {
                     inFlightMessages.remove(e.getKey());
-                    requeueOrDeadLetter(e.getValue().getMessage(),
+                    Message leaving = requeueOrDeadLetter(e.getValue().getMessage(),
                             e.getValue().getRetryCount() + 1);
+                    if (leaving != null) {
+                        departing.add(leaving);
+                    }
                 });
+
+        return departing;
     }
 
     private void compactLog(WalWriter writer) {
