@@ -16,22 +16,35 @@ import com.javaqueue.core.Message;
 import com.javaqueue.core.QueueConfig;
 import com.javaqueue.core.QueueManager;
 import com.javaqueue.core.Receipt;
+import com.javaqueue.core.Topic;
+import com.javaqueue.core.TopicManager;
 import com.javaqueue.exception.InvalidReceiptException;
 import com.javaqueue.exception.QueueNotFoundException;
+import com.javaqueue.exception.TopicNotFoundException;
 import com.javaqueue.json.JsonUtils;
 
 /**
- * Routes HTTP requests onto the QueueManager.
+ * Routes HTTP requests onto the QueueManager and TopicManager.
  *
- * | Method | Path                                    |
- * |--------|-----------------------------------------|
- * | GET    | /queues                                 |
- * | POST   | /queues/{name}                          |
- * | DELETE | /queues/{name}                          |
- * | POST   | /queues/{name}/messages                 |
- * | GET    | /queues/{name}/messages?waitSeconds=n   |
- * | DELETE | /queues/{name}/messages/{handle}        |
- * | POST   | /queues/{name}/messages/{handle}/nack   |
+ * | Method | Path                                       |
+ * |--------|--------------------------------------------|
+ * | GET    | /queues                                    |
+ * | POST   | /queues/{name}                             |
+ * | DELETE | /queues/{name}                             |
+ * | POST   | /queues/{name}/messages                    |
+ * | GET    | /queues/{name}/messages?waitSeconds=n      |
+ * | DELETE | /queues/{name}/messages/{handle}           |
+ * | POST   | /queues/{name}/messages/{handle}/nack      |
+ * | GET    | /topics                                    |
+ * | POST   | /topics/{name}                             |
+ * | DELETE | /topics/{name}                             |
+ * | GET    | /topics/{name}/subscriptions               |
+ * | POST   | /topics/{name}/subscriptions/{queue}       |
+ * | DELETE | /topics/{name}/subscriptions/{queue}       |
+ * | POST   | /topics/{name}/messages                    |
+ *
+ * There is deliberately no GET /topics/{name}/messages. A topic routes, it
+ * does not store — you consume from a subscriber queue, never from the topic.
  */
 public class QueueHandler extends Handler.Abstract {
 
@@ -42,9 +55,11 @@ public class QueueHandler extends Handler.Abstract {
     static final int MAX_WAIT_SECONDS = 20;
 
     private final QueueManager queueManager;
+    private final TopicManager topicManager;
 
-    public QueueHandler(QueueManager manager) {
-        this.queueManager = manager;
+    public QueueHandler(QueueManager queueManager, TopicManager topicManager) {
+        this.queueManager = queueManager;
+        this.topicManager = topicManager;
     }
 
     @Override
@@ -55,12 +70,42 @@ public class QueueHandler extends Handler.Abstract {
         // path="/queues/orders/messages" → segments=["","queues","orders","messages"]
         String[] segments = path.split("/");
 
-        if (segments.length < 2 || !segments[1].equals("queues")) {
+        if (segments.length < 2) {
             writeError(response, callback, 404, "Not found");
             return true;
         }
 
+        // Exception mapping is shared across both resources, so it wraps the
+        // dispatch rather than being repeated inside each one.
         try {
+            switch (segments[1]) {
+                case "queues" -> routeQueues(segments, method, request, response, callback);
+                case "topics" -> routeTopics(segments, method, request, response, callback);
+                default -> writeError(response, callback, 404, "Not found");
+            }
+        } catch (QueueNotFoundException | TopicNotFoundException e) {
+            writeError(response, callback, 404, e.getMessage());
+        } catch (InvalidReceiptException e) {
+            writeError(response, callback, 404, e.getMessage());
+        } catch (JsonUtils.JsonParseException | NumberFormatException e) {
+            writeError(response, callback, 400, "Malformed request: " + e.getMessage());
+        } catch (InterruptedException e) {
+            // Server is shutting down under this request — restore the flag and
+            // tell the client rather than swallowing it.
+            Thread.currentThread().interrupt();
+            writeError(response, callback, 503, "Server shutting down");
+        } catch (Exception e) {
+            writeError(response, callback, 500, "Internal server error");
+        }
+
+        return true;
+    }
+
+    // ── /queues ───────────────────────────────────────────────────────────────
+
+    private void routeQueues(String[] segments, String method, Request request,
+            Response response, Callback callback) throws Exception {
+        {
             switch (segments.length) {
                 case 2 -> { // /queues
                     if (method.equals("GET")) {
@@ -109,22 +154,153 @@ public class QueueHandler extends Handler.Abstract {
                 }
                 default -> writeError(response, callback, 404, "Not found");
             }
-        } catch (QueueNotFoundException e) {
-            writeError(response, callback, 404, e.getMessage());
-        } catch (InvalidReceiptException e) {
-            writeError(response, callback, 404, e.getMessage());
-        } catch (JsonUtils.JsonParseException | NumberFormatException e) {
-            writeError(response, callback, 400, "Malformed request: " + e.getMessage());
-        } catch (InterruptedException e) {
-            // Server is shutting down under this request — restore the flag and
-            // tell the client rather than swallowing it.
-            Thread.currentThread().interrupt();
-            writeError(response, callback, 503, "Server shutting down");
-        } catch (Exception e) {
-            writeError(response, callback, 500, "Internal server error");
+        }
+    }
+
+    // ── /topics ───────────────────────────────────────────────────────────────
+
+    private void routeTopics(String[] segments, String method, Request request,
+            Response response, Callback callback) throws Exception {
+        switch (segments.length) {
+            case 2 -> { // /topics
+                if (method.equals("GET")) {
+                    handleListTopics(response, callback);
+                } else {
+                    writeError(response, callback, 405, "Method not allowed");
+                }
+            }
+            case 3 -> { // /topics/{name}
+                if (method.equals("POST")) {
+                    handleCreateTopic(segments[2], response, callback);
+                } else if (method.equals("DELETE")) {
+                    handleDeleteTopic(segments[2], response, callback);
+                } else {
+                    writeError(response, callback, 405, "Method not allowed");
+                }
+            }
+            case 4 -> { // /topics/{name}/messages | /topics/{name}/subscriptions
+                switch (segments[3]) {
+                    case "messages" -> {
+                        if (method.equals("POST")) {
+                            handleTopicPublish(segments[2], request, response, callback);
+                        } else if (method.equals("GET")) {
+                            // A topic routes, it does not store. There is
+                            // nothing to consume from here — only from a
+                            // subscriber queue. The path exists, the operation
+                            // does not, so this is 405 rather than 404.
+                            writeError(response, callback, 405,
+                                    "Cannot consume from a topic — consume from a subscriber queue instead");
+                        } else {
+                            writeError(response, callback, 405, "Method not allowed");
+                        }
+                    }
+                    case "subscriptions" -> {
+                        if (method.equals("GET")) {
+                            handleListSubscriptions(segments[2], response, callback);
+                        } else {
+                            writeError(response, callback, 405, "Method not allowed");
+                        }
+                    }
+                    default -> writeError(response, callback, 404, "Not found");
+                }
+            }
+            case 5 -> { // /topics/{name}/subscriptions/{queue}
+                if (!segments[3].equals("subscriptions")) {
+                    writeError(response, callback, 404, "Not found");
+                } else if (method.equals("POST")) {
+                    handleSubscribe(segments[2], segments[4], response, callback);
+                } else if (method.equals("DELETE")) {
+                    handleUnsubscribe(segments[2], segments[4], response, callback);
+                } else {
+                    writeError(response, callback, 405, "Method not allowed");
+                }
+            }
+            default -> writeError(response, callback, 404, "Not found");
+        }
+    }
+
+    // GET /topics → 200 {"topics":["orders-events"]}
+    private void handleListTopics(Response response, Callback callback) {
+        writeJson(response, callback, 200, jsonNameArray("topics", topicManager.listTopics()));
+    }
+
+    // POST /topics/{name} → 201 {"name":"orders-events"}
+    private void handleCreateTopic(String name, Response response, Callback callback) {
+        topicManager.createTopic(name);
+        writeJson(response, callback, 201, JsonUtils.toJson(Map.of("name", name)));
+    }
+
+    // DELETE /topics/{name} → 204
+    private void handleDeleteTopic(String name, Response response, Callback callback) {
+        topicManager.getTopic(name); // 404 rather than a cheerful 204
+        topicManager.deleteTopic(name);
+        writeEmpty(response, callback, 204);
+    }
+
+    // GET /topics/{name}/subscriptions → 200 {"subscribers":["billing"]}
+    private void handleListSubscriptions(String name, Response response, Callback callback) {
+        writeJson(response, callback, 200,
+                jsonNameArray("subscribers", topicManager.getTopic(name).listSubscribers()));
+    }
+
+    // POST /topics/{name}/subscriptions/{queue} → 201
+    private void handleSubscribe(String topicName, String queueName,
+            Response response, Callback callback) {
+        Topic topic = topicManager.getTopic(topicName);
+
+        // Resolve through the QueueManager so an unknown queue is a 404 here,
+        // rather than a subscription that silently never delivers.
+        topic.subscribe(queueManager.getQueue(queueName));
+
+        writeJson(response, callback, 201,
+                JsonUtils.toJson(Map.of("topic", topicName, "queue", queueName)));
+    }
+
+    // DELETE /topics/{name}/subscriptions/{queue} → 204
+    private void handleUnsubscribe(String topicName, String queueName,
+            Response response, Callback callback) {
+        topicManager.getTopic(topicName).unsubscribe(queueName);
+        writeEmpty(response, callback, 204);
+    }
+
+    // POST /topics/{name}/messages → 201 {"messageId":"42","delivered":"3"}
+    private void handleTopicPublish(String name, Request request,
+            Response response, Callback callback) throws Exception {
+        Topic topic = topicManager.getTopic(name);
+
+        Map<String, String> fields = JsonUtils.fromJson(readBody(request));
+        String payload = fields.get("payload");
+        if (payload == null) {
+            writeError(response, callback, 400, "Body must contain a 'payload' field");
+            return;
         }
 
-        return true;
+        Message message = new Message(payload);
+        int delivered = topic.publish(message);
+
+        // delivered is reported as a string like every other field — JsonUtils
+        // serializes a flat string map, and the HTTP API has been consistent
+        // about that since Phase 4.
+        Map<String, String> body = new LinkedHashMap<>();
+        body.put("messageId", message.getId());
+        body.put("delivered", String.valueOf(delivered));
+        writeJson(response, callback, 201, JsonUtils.toJson(body));
+    }
+
+    // Renders {"<key>":["a","b"]} with names escaped.
+    // Fully qualified: this class extends Handler.Abstract, which inherits a
+    // nested Handler.Collection that would otherwise shadow java.util.Collection.
+    private String jsonNameArray(String key, java.util.Collection<String> names) {
+        StringBuilder sb = new StringBuilder("{\"").append(key).append("\":[");
+        boolean first = true;
+        for (String name : names) {
+            if (!first) {
+                sb.append(",");
+            }
+            sb.append("\"").append(JsonUtils.escape(name)).append("\"");
+            first = false;
+        }
+        return sb.append("]}").toString();
     }
 
     // GET /queues → 200 {"queues":["orders","payments"]}

@@ -18,6 +18,7 @@ import org.junit.jupiter.api.Test;
 
 import com.javaqueue.core.Message;
 import com.javaqueue.core.QueueManager;
+import com.javaqueue.core.TopicManager;
 import com.javaqueue.json.JsonUtils;
 
 /**
@@ -34,7 +35,7 @@ class QueueServerTest {
     @BeforeEach
     void setUp() throws Exception {
         manager = new QueueManager();
-        server = new QueueServer(manager, 0);
+        server = new QueueServer(manager, new TopicManager(manager), 0);
         server.start();
         baseUrl = "http://localhost:" + server.getPort();
         client = HttpClient.newBuilder()

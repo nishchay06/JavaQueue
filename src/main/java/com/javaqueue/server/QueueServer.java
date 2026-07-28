@@ -4,11 +4,12 @@ import org.eclipse.jetty.server.Server;
 import org.eclipse.jetty.server.ServerConnector;
 
 import com.javaqueue.core.QueueManager;
+import com.javaqueue.core.TopicManager;
 
 /**
- * Wraps a Jetty server around a QueueManager.
+ * Wraps a Jetty server around a QueueManager and a TopicManager.
  *
- * The manager is passed in rather than owned, so tests can inspect queue state
+ * The managers are passed in rather than owned, so tests can inspect state
  * directly instead of going through HTTP for everything. Lifecycle is explicit:
  * constructing the server does not bind the port — start() does.
  */
@@ -17,12 +18,12 @@ public class QueueServer {
     private final Server server;
     private final ServerConnector connector;
 
-    public QueueServer(QueueManager manager, int port) {
+    public QueueServer(QueueManager queueManager, TopicManager topicManager, int port) {
         this.server = new Server();
         this.connector = new ServerConnector(server);
         this.connector.setPort(port);
         this.server.addConnector(connector);
-        this.server.setHandler(new QueueHandler(manager));
+        this.server.setHandler(new QueueHandler(queueManager, topicManager));
     }
 
     public void start() throws Exception {

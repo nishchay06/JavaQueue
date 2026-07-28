@@ -40,6 +40,18 @@ public class QueueManager {
         return queue;
     }
 
+    /**
+     * The non-throwing counterpart to getQueue — returns null if absent.
+     *
+     * For callers where a missing queue is an expected condition rather than
+     * an error, such as fan-out delivery to a subscriber that has since been
+     * deleted. Using getQueue there would mean driving normal control flow
+     * with exceptions; a separate check would be a TOCTOU race.
+     */
+    public MessageQueue findQueue(String name) {
+        return queues.get(name);
+    }
+
     public void deleteQueue(String name) {
         MessageQueue queue = queues.remove(name);
         if (queue != null) {
