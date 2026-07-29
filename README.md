@@ -4,6 +4,13 @@ A message queue built from scratch in Java, designed as a deep-learning project 
 
 Rather than wrapping existing libraries, this project works directly with raw Java concurrency primitives — `synchronized`, `wait()`/`notifyAll()`, `AtomicLong`, and `ConcurrentHashMap` — to understand what production queue systems are actually doing under the hood.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/dashboard-dark.png">
+  <img alt="The JavaQueue operator dashboard, showing queues, topics and logs side by side" src="docs/screenshots/dashboard-light.png">
+</picture>
+
+<sup>All three models at once. `orders-events` fans out to `billing` and `analytics`, both sitting at depth 6 — one publish, two independent copies. `payments` routes to a dead-letter queue that has actually caught something. `audit-events` has no subscribers, so its publishes reach nobody. And on the `events` log, `indexer` has committed everything while `warehouse` is 34 records behind — the number an operator actually watches. Light and dark are both designed; the image follows your theme.</sup>
+
 ---
 
 ## Why Build This?
@@ -520,7 +527,7 @@ A poll response contains an array of records, and `JsonUtils` is a flat parser t
 
 ## The Dashboard
 
-`http://localhost:8080/` serves an operator view of everything the server is doing — the three models side by side, refreshing once a second.
+`http://localhost:8080/` serves an operator view of everything the server is doing — the three models side by side, refreshing once a second. ([screenshot at the top of this file](#javaqueue))
 
 - **Queues** — depth, in-flight, parked long-poll waiters, configured DLQ
 - **Topics** — subscribers per topic, and a visible warning when a topic has none, since publishes then reach nobody
