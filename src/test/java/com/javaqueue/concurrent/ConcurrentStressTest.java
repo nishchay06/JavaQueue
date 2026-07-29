@@ -92,6 +92,9 @@ public class ConcurrentStressTest {
     @Test
     void testSustainedLoadNoDeadlock() throws InterruptedException {
         int threadCount = 10;
+        // Generous: this bounds how long consumers get to clear the backlog,
+        // not how long the drain is expected to take.
+        final long DRAIN_TIMEOUT_MS = 60_000;
         AtomicInteger published = new AtomicInteger(0);
         AtomicInteger consumed = new AtomicInteger(0);
 
@@ -127,18 +130,39 @@ public class ConcurrentStressTest {
         producers.shutdown();
         producers.awaitTermination(10, TimeUnit.SECONDS);
 
-        // Give consumers time to drain remaining messages
-        Thread.sleep(500);
+        // Drain until the queue is actually empty rather than sleeping a fixed
+        // interval and hoping. On a machine with fewer cores than this test has
+        // threads, producers outrun consumers and leave a backlog that a short
+        // sleep will not clear -- which looks identical to message loss.
+        long drainDeadline = System.currentTimeMillis() + DRAIN_TIMEOUT_MS;
+        while (queue.depth() > 0 && System.currentTimeMillis() < drainDeadline) {
+            Thread.sleep(10);
+        }
+
         consumers.shutdownNow();
         consumers.awaitTermination(5, TimeUnit.SECONDS);
 
-        System.out.println("Published: " + published.get());
-        System.out.println("Consumed:  " + consumed.get());
+        // Everything is quiescent now, so these three reads are consistent.
+        int publishedCount = published.get();
+        int consumedCount = consumed.get();
+        int residualDepth = queue.depth();
 
-        // Both counts should be non-zero and roughly equal
-        assertTrue(published.get() > 0, "Nothing was published");
-        assertTrue(consumed.get() > 0, "Nothing was consumed");
-        assertEquals(published.get(), consumed.get(), "Messages lost under sustained load");
+        System.out.println("Published: " + publishedCount);
+        System.out.println("Consumed:  " + consumedCount);
+        System.out.println("Residual:  " + residualDepth);
+
+        assertTrue(publishedCount > 0, "Nothing was published");
+        assertTrue(consumedCount > 0, "Nothing was consumed");
+
+        // The real invariant: every published message was either consumed or is
+        // still sitting in the queue. A shortfall here is genuine loss and a
+        // violation of at-least-once delivery. A backlog that merely failed to
+        // drain in time is not.
+        assertEquals(publishedCount, consumedCount + residualDepth,
+                "Messages unaccounted for: published != consumed + still queued");
+
+        assertEquals(0, residualDepth,
+                "Queue did not drain within " + DRAIN_TIMEOUT_MS + "ms of producers stopping");
     }
 
     // ─── Test 3: Slow consumers — queue accumulates then drains ──────────────
