@@ -432,6 +432,40 @@ public class MessageQueue {
         return name;
     }
 
+    // ── Observability ─────────────────────────────────────────────────────────
+    // Non-destructive accessors, so an operator view can answer "how deep is
+    // this queue" without consuming from it.
+
+    /** Messages waiting to be consumed. */
+    public int depth() {
+        synchronized (this) {
+            return messages.size();
+        }
+    }
+
+    /** Messages consumed but not yet acknowledged. */
+    public int inFlightCount() {
+        synchronized (this) {
+            return inFlightMessages.size();
+        }
+    }
+
+    /** Consumers currently parked in an async wait. */
+    public int waiterCount() {
+        synchronized (this) {
+            return waiters.size();
+        }
+    }
+
+    /** The configured dead letter queue name, or null if there is none. */
+    public String getDeadLetterQueueName() {
+        return config.getDeadLetterQueueName();
+    }
+
+    public QueueConfig getConfig() {
+        return config;
+    }
+
     // Returns messages bound for the DLQ, to be published by the caller once
     // this queue's monitor is released — same contract as requeueOrDeadLetter.
     // In practice this is always empty during construction, since the DLQ is

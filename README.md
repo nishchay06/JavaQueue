@@ -518,6 +518,24 @@ A poll response contains an array of records, and `JsonUtils` is a flat parser t
 
 ---
 
+## The Dashboard
+
+`http://localhost:8080/` serves an operator view of everything the server is doing — the three models side by side, refreshing once a second.
+
+- **Queues** — depth, in-flight, parked long-poll waiters, configured DLQ
+- **Topics** — subscribers per topic, and a visible warning when a topic has none, since publishes then reach nobody
+- **Logs** — retained offset range, retention policy, and **per-group lag as a bar** next to committed and read position
+
+The interesting behaviours here are all visual over time, which is why they are worth a page rather than a log line: lag climbing and dropping the moment a group commits, one publish landing in two subscriber queues at once, `beginOffset` marching forward as retention trims, a group falling off the back of the log and being reset by its policy.
+
+Buttons publish, consume, append, commit and rewind, so the whole system is drivable without a terminal. The activity feed shows every request and response, including failures.
+
+It is served by the same Jetty as the API, so the page is same-origin and needs no cross-origin arrangement. Everything is inlined — no CDN, no external stylesheet — matching the project's no-dependencies philosophy, and it works offline.
+
+`GET /stats` returns the whole snapshot in one call. That is deliberate: a request per resource would mean N+1 round trips and a page rendering torn state, with queues from one instant beside logs from another.
+
+---
+
 ## Getting Started
 
 **Prerequisites**
