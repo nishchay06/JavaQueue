@@ -98,6 +98,29 @@ public class QueueHandler extends Handler.Abstract {
         String path = request.getHttpURI().getPath();
         String method = request.getMethod();
 
+        // The dashboard and its data feed, checked before the segment split:
+        // "/".split("/") yields an empty array, so the root path never
+        // survives the length guard below.
+        //
+        // Both are served from the same origin as the API, which is what lets
+        // a browser page call it at all.
+        if (path.equals("/") || path.equals("/dashboard")) {
+            if (method.equals("GET")) {
+                writeHtml(response, callback, Dashboard.html());
+            } else {
+                writeError(response, callback, 405, "Method not allowed");
+            }
+            return true;
+        }
+        if (path.equals("/stats")) {
+            if (method.equals("GET")) {
+                writeJson(response, callback, 200, buildStats());
+            } else {
+                writeError(response, callback, 405, "Method not allowed");
+            }
+            return true;
+        }
+
         // path="/queues/orders/messages" → segments=["","queues","orders","messages"]
         String[] segments = path.split("/");
 
@@ -515,6 +538,98 @@ public class QueueHandler extends Handler.Abstract {
             }
         }
         writeEmpty(response, callback, 204);
+    }
+
+    /**
+     * One snapshot of everything, for the dashboard.
+     *
+     * A single call rather than a request per resource: the page would
+     * otherwise need N+1 round trips and would render torn state, with queues
+     * from one instant next to logs from another.
+     *
+     * Built by hand because this response is nested, and JsonUtils is a flat
+     * parser by design. Browsers have a real JSON parser; the constraint only
+     * ever bound our own reading of these bodies.
+     */
+    private String buildStats() {
+        StringBuilder sb = new StringBuilder("{\"queues\":[");
+
+        boolean first = true;
+        for (String name : queueManager.listQueues()) {
+            MessageQueue queue = queueManager.findQueue(name);
+            if (queue == null) {
+                continue;
+            }
+            if (!first) {
+                sb.append(",");
+            }
+            Map<String, String> fields = new LinkedHashMap<>();
+            fields.put("name", name);
+            fields.put("depth", String.valueOf(queue.depth()));
+            fields.put("inFlight", String.valueOf(queue.inFlightCount()));
+            fields.put("waiters", String.valueOf(queue.waiterCount()));
+            fields.put("deadLetterQueue", queue.getDeadLetterQueueName());
+            fields.put("persistent", String.valueOf(queue.getConfig().getLogDirectory() != null));
+            sb.append(JsonUtils.toJson(fields));
+            first = false;
+        }
+
+        sb.append("],\"topics\":[");
+        first = true;
+        for (String name : topicManager.listTopics()) {
+            if (!first) {
+                sb.append(",");
+            }
+            sb.append("{\"name\":\"").append(JsonUtils.escape(name)).append("\",\"subscribers\":[");
+            boolean firstSub = true;
+            for (String subscriber : topicManager.getTopic(name).listSubscribers()) {
+                if (!firstSub) {
+                    sb.append(",");
+                }
+                sb.append("\"").append(JsonUtils.escape(subscriber)).append("\"");
+                firstSub = false;
+            }
+            sb.append("]}");
+            first = false;
+        }
+
+        sb.append("],\"logs\":[");
+        first = true;
+        for (String name : logManager.listLogs()) {
+            MessageLog log = logManager.getLog(name);
+            if (!first) {
+                sb.append(",");
+            }
+            sb.append("{\"name\":\"").append(JsonUtils.escape(name)).append("\"")
+                    .append(",\"beginOffset\":").append(log.beginOffset())
+                    .append(",\"endOffset\":").append(log.endOffset())
+                    .append(",\"records\":").append(log.recordCount())
+                    .append(",\"maxRecords\":").append(log.getConfig().getMaxRecords())
+                    .append(",\"retentionMs\":").append(log.getConfig().getRetentionMs())
+                    .append(",\"resetPolicy\":\"").append(log.getConfig().getResetPolicy())
+                    .append("\",\"groups\":[");
+            boolean firstGroup = true;
+            for (String group : log.groups()) {
+                if (!firstGroup) {
+                    sb.append(",");
+                }
+                sb.append("{\"name\":\"").append(JsonUtils.escape(group)).append("\"")
+                        .append(",\"committed\":").append(log.committed(group))
+                        .append(",\"position\":").append(log.position(group))
+                        .append(",\"lag\":").append(log.lag(group)).append("}");
+                firstGroup = false;
+            }
+            sb.append("]}");
+            first = false;
+        }
+
+        return sb.append("]}").toString();
+    }
+
+    private void writeHtml(Response response, Callback callback, String html) {
+        response.getHeaders().put("Content-Type", "text/html; charset=utf-8");
+        response.setStatus(200);
+        response.write(true, ByteBuffer.wrap(html.getBytes(StandardCharsets.UTF_8)), callback);
     }
 
     // Renders {"<key>":["a","b"]} with names escaped.

@@ -141,6 +141,24 @@ public class MessageLog {
 
     // ── Observing ─────────────────────────────────────────────────────────────
 
+    /** Group names this log has seen — enough to report lag without guessing. */
+    public java.util.Set<String> groups() {
+        synchronized (this) {
+            return new java.util.LinkedHashSet<>(groups.keySet());
+        }
+    }
+
+    /** Records currently retained — not the number of offsets ever assigned. */
+    public int recordCount() {
+        synchronized (this) {
+            return records.size();
+        }
+    }
+
+    public LogConfig getConfig() {
+        return config;
+    }
+
     /** The oldest offset still retained. */
     public long beginOffset() {
         synchronized (this) {
