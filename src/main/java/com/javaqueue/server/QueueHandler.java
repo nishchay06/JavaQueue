@@ -20,11 +20,18 @@ import org.eclipse.jetty.util.Callback;
 import com.javaqueue.core.MessageQueue;
 import com.javaqueue.core.Message;
 import com.javaqueue.core.QueueConfig;
+import com.javaqueue.core.LogConfig;
+import com.javaqueue.core.LogManager;
+import com.javaqueue.core.LogRecords;
+import com.javaqueue.core.MessageLog;
+import com.javaqueue.core.OffsetResetPolicy;
 import com.javaqueue.core.QueueManager;
 import com.javaqueue.core.Receipt;
 import com.javaqueue.core.Topic;
 import com.javaqueue.core.TopicManager;
 import com.javaqueue.exception.InvalidReceiptException;
+import com.javaqueue.exception.LogNotFoundException;
+import com.javaqueue.exception.OffsetOutOfRangeException;
 import com.javaqueue.exception.QueueNotFoundException;
 import com.javaqueue.exception.TopicNotFoundException;
 import com.javaqueue.json.JsonUtils;
@@ -62,6 +69,7 @@ public class QueueHandler extends Handler.Abstract {
 
     private final QueueManager queueManager;
     private final TopicManager topicManager;
+    private final LogManager logManager;
 
     // Fires the 204 when a long poll reaches its deadline. One shared daemon
     // thread for all pending polls — which is the entire point: waiting costs
@@ -73,9 +81,11 @@ public class QueueHandler extends Handler.Abstract {
                 return thread;
             });
 
-    public QueueHandler(QueueManager queueManager, TopicManager topicManager) {
+    public QueueHandler(QueueManager queueManager, TopicManager topicManager,
+            LogManager logManager) {
         this.queueManager = queueManager;
         this.topicManager = topicManager;
+        this.logManager = logManager;
     }
 
     /** Shuts down the timeout scheduler. Called by QueueServer.stop(). */
@@ -102,12 +112,15 @@ public class QueueHandler extends Handler.Abstract {
             switch (segments[1]) {
                 case "queues" -> routeQueues(segments, method, request, response, callback);
                 case "topics" -> routeTopics(segments, method, request, response, callback);
+                case "logs" -> routeLogs(segments, method, request, response, callback);
                 default -> writeError(response, callback, 404, "Not found");
             }
-        } catch (QueueNotFoundException | TopicNotFoundException e) {
+        } catch (QueueNotFoundException | TopicNotFoundException | LogNotFoundException e) {
             writeError(response, callback, 404, e.getMessage());
         } catch (InvalidReceiptException e) {
             writeError(response, callback, 404, e.getMessage());
+        } catch (OffsetOutOfRangeException e) {
+            writeError(response, callback, 400, e.getMessage());
         } catch (JsonUtils.JsonParseException | NumberFormatException e) {
             writeError(response, callback, 400, "Malformed request: " + e.getMessage());
         } catch (InterruptedException e) {
@@ -306,6 +319,202 @@ public class QueueHandler extends Handler.Abstract {
         body.put("messageId", message.getId());
         body.put("delivered", String.valueOf(delivered));
         writeJson(response, callback, 201, JsonUtils.toJson(body));
+    }
+
+    // ── /logs ─────────────────────────────────────────────────────────────────
+
+    private void routeLogs(String[] segments, String method, Request request,
+            Response response, Callback callback) throws Exception {
+        switch (segments.length) {
+            case 2 -> { // /logs
+                if (method.equals("GET")) {
+                    writeJson(response, callback, 200,
+                            jsonNameArray("logs", logManager.listLogs()));
+                } else {
+                    writeError(response, callback, 405, "Method not allowed");
+                }
+            }
+            case 3 -> { // /logs/{name}
+                if (method.equals("POST")) {
+                    handleCreateLog(segments[2], request, response, callback);
+                } else if (method.equals("DELETE")) {
+                    logManager.getLog(segments[2]); // 404 rather than a cheerful 204
+                    logManager.deleteLog(segments[2]);
+                    writeEmpty(response, callback, 204);
+                } else {
+                    writeError(response, callback, 405, "Method not allowed");
+                }
+            }
+            case 4 -> { // /logs/{name}/records
+                if (!segments[3].equals("records")) {
+                    writeError(response, callback, 404, "Not found");
+                } else if (method.equals("POST")) {
+                    handleAppend(segments[2], request, response, callback);
+                } else if (method.equals("GET")) {
+                    handlePoll(segments[2], request, response, callback);
+                } else {
+                    writeError(response, callback, 405, "Method not allowed");
+                }
+            }
+            case 5 -> { // /logs/{name}/groups/{group}
+                if (!segments[3].equals("groups")) {
+                    writeError(response, callback, 404, "Not found");
+                } else if (method.equals("GET")) {
+                    handleGroupStatus(segments[2], segments[4], response, callback);
+                } else {
+                    writeError(response, callback, 405, "Method not allowed");
+                }
+            }
+            case 6 -> { // /logs/{name}/groups/{group}/{commit|seek}
+                if (!segments[3].equals("groups") || !method.equals("POST")) {
+                    writeError(response, callback, 404, "Not found");
+                } else if (segments[5].equals("commit")) {
+                    handleCommit(segments[2], segments[4], request, response, callback);
+                } else if (segments[5].equals("seek")) {
+                    handleSeek(segments[2], segments[4], request, response, callback);
+                } else {
+                    writeError(response, callback, 404, "Not found");
+                }
+            }
+            default -> writeError(response, callback, 404, "Not found");
+        }
+    }
+
+    // POST /logs/{name} → 201 {"name":"orders"}
+    private void handleCreateLog(String name, Request request, Response response, Callback callback)
+            throws Exception {
+        Map<String, String> fields = JsonUtils.fromJson(readBody(request));
+        LogConfig defaults = LogConfig.defaults();
+
+        long retentionMs = fields.containsKey("retentionMs")
+                ? Long.parseLong(fields.get("retentionMs"))
+                : defaults.getRetentionMs();
+        int maxRecords = fields.containsKey("maxRecords")
+                ? Integer.parseInt(fields.get("maxRecords"))
+                : defaults.getMaxRecords();
+        OffsetResetPolicy policy = fields.containsKey("resetPolicy")
+                ? OffsetResetPolicy.valueOf(fields.get("resetPolicy").toUpperCase())
+                : defaults.getResetPolicy();
+
+        logManager.createLog(name,
+                new LogConfig(retentionMs, maxRecords, policy, fields.get("logDirectory")));
+        writeJson(response, callback, 201, JsonUtils.toJson(Map.of("name", name)));
+    }
+
+    // POST /logs/{name}/records → 201 {"offset":"42"}
+    private void handleAppend(String name, Request request, Response response, Callback callback)
+            throws Exception {
+        MessageLog log = logManager.getLog(name);
+
+        Map<String, String> fields = JsonUtils.fromJson(readBody(request));
+        String payload = fields.get("payload");
+        if (payload == null) {
+            writeError(response, callback, 400, "Body must contain a 'payload' field");
+            return;
+        }
+
+        long offset = log.append(new Message(payload));
+        writeJson(response, callback, 201,
+                JsonUtils.toJson(Map.of("offset", String.valueOf(offset))));
+    }
+
+    // GET /logs/{name}/records?group=g&max=n
+    //   → 200 records plus the offsets they span, 204 when there is nothing new
+    private void handlePoll(String name, Request request, Response response, Callback callback) {
+        MessageLog log = logManager.getLog(name);
+
+        String group = Request.extractQueryParameters(request).getValue("group");
+        if (group == null || group.isBlank()) {
+            writeError(response, callback, 400, "A 'group' query parameter is required");
+            return;
+        }
+
+        String maxParam = Request.extractQueryParameters(request).getValue("max");
+        int max = (maxParam == null || maxParam.isBlank()) ? 10 : Integer.parseInt(maxParam);
+
+        LogRecords batch = log.poll(group, max);
+        if (batch.isEmpty()) {
+            writeEmpty(response, callback, 204);
+            return;
+        }
+
+        StringBuilder sb = new StringBuilder("{\"records\":[");
+        boolean first = true;
+        for (Message message : batch.messages()) {
+            if (!first) {
+                sb.append(",");
+            }
+            Map<String, String> record = new LinkedHashMap<>();
+            record.put("messageId", message.getId());
+            record.put("payload", message.getPayload());
+            sb.append(JsonUtils.toJson(record));
+            first = false;
+        }
+        sb.append("],\"startOffset\":\"").append(batch.startOffset())
+                .append("\",\"nextOffset\":\"").append(batch.nextOffset()).append("\"}");
+
+        writeJson(response, callback, 200, sb.toString());
+    }
+
+    // GET /logs/{name}/groups/{group} → committed, endOffset, lag
+    private void handleGroupStatus(String name, String group, Response response, Callback callback) {
+        MessageLog log = logManager.getLog(name);
+
+        Map<String, String> body = new LinkedHashMap<>();
+        body.put("group", group);
+        body.put("committed", String.valueOf(log.committed(group)));
+        body.put("beginOffset", String.valueOf(log.beginOffset()));
+        body.put("endOffset", String.valueOf(log.endOffset()));
+        body.put("lag", String.valueOf(log.lag(group)));
+        writeJson(response, callback, 200, JsonUtils.toJson(body));
+    }
+
+    // POST /logs/{name}/groups/{group}/commit → 204, body {"offset":42}
+    private void handleCommit(String name, String group, Request request,
+            Response response, Callback callback) throws Exception {
+        MessageLog log = logManager.getLog(name);
+
+        String offset = JsonUtils.fromJson(readBody(request)).get("offset");
+        if (offset == null) {
+            writeError(response, callback, 400, "Body must contain an 'offset' field");
+            return;
+        }
+
+        log.commit(group, Long.parseLong(offset));
+        writeEmpty(response, callback, 204);
+    }
+
+    // POST /logs/{name}/groups/{group}/seek → 204
+    // Body is {"offset":n} or {"position":"earliest"|"latest"}
+    private void handleSeek(String name, String group, Request request,
+            Response response, Callback callback) throws Exception {
+        MessageLog log = logManager.getLog(name);
+        Map<String, String> fields = JsonUtils.fromJson(readBody(request));
+
+        String offset = fields.get("offset");
+        if (offset != null) {
+            log.seek(group, Long.parseLong(offset));
+            writeEmpty(response, callback, 204);
+            return;
+        }
+
+        String position = fields.get("position");
+        if (position == null) {
+            writeError(response, callback, 400,
+                    "Body must contain either 'offset' or 'position'");
+            return;
+        }
+
+        switch (position.toLowerCase()) {
+            case "earliest" -> log.seekToBeginning(group);
+            case "latest" -> log.seekToEnd(group);
+            default -> {
+                writeError(response, callback, 400,
+                        "'position' must be 'earliest' or 'latest'");
+                return;
+            }
+        }
+        writeEmpty(response, callback, 204);
     }
 
     // Renders {"<key>":["a","b"]} with names escaped.

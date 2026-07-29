@@ -44,7 +44,15 @@ javaqueue/
     │           │   ├── Topic.java             # Named subscriber list; fan-out publish
     │           │   ├── TopicManager.java      # Registry of topics; replays topic config
     │           │   ├── TopicLog.java          # Persists SUBSCRIBE / UNSUBSCRIBE records
-    │           │   └── TopicOperation.java    # Enum: CREATE_TOPIC, DELETE_TOPIC, SUBSCRIBE, UNSUBSCRIBE
+    │           │   ├── TopicOperation.java    # Enum: CREATE_TOPIC, DELETE_TOPIC, SUBSCRIBE, UNSUBSCRIBE
+    │           │   ├── MessageLog.java        # Retained offset-indexed log — the Kafka model
+    │           │   ├── LogManager.java        # Registry of logs; owns the shared offset store
+    │           │   ├── LogConfig.java         # retentionMs, maxRecords, resetPolicy, log dir
+    │           │   ├── LogRecords.java        # A poll result: records + the offsets they span
+    │           │   ├── OffsetResetPolicy.java # Enum: EARLIEST, LATEST, ERROR
+    │           │   ├── RecordStore.java       # The log file — APPEND and TRIM records
+    │           │   ├── OffsetStore.java       # Shared _offsets.log, mirroring __consumer_offsets
+    │           │   └── RetentionScanner.java  # Daemon thread — trims by age
     │           ├── server/
     │           │   ├── QueueServer.java       # Jetty lifecycle — start, stop, bound port
     │           │   └── QueueHandler.java      # Routes HTTP requests onto the QueueManager
@@ -69,12 +77,17 @@ javaqueue/
                 │   ├── FanOutTest.java
                 │   ├── TopicPersistenceTest.java
                 │   ├── AsyncConsumeTest.java
-                │   └── DefaultLogDirectoryTest.java
+                │   ├── DefaultLogDirectoryTest.java
+                │   ├── MessageLogTest.java
+                │   ├── ConsumerGroupTest.java
+                │   ├── RetentionTest.java
+                │   └── LogPersistenceTest.java
                 ├── json/
                 │   └── JsonUtilsTest.java
                 ├── server/
                 │   ├── QueueServerTest.java
-                │   └── TopicServerTest.java
+                │   ├── TopicServerTest.java
+                │   └── LogServerTest.java
                 └── concurrent/
                     ├── ConcurrentStressTest.java
                     └── DeliveryGuaranteesStressTest.java
@@ -92,7 +105,8 @@ javaqueue/
 | 4 | Networking | ✅ Complete | HTTP API with long polling so external processes can connect |
 | 5 | Consumer Groups | ✅ Complete | SNS-style fan-out — a topic delivers to N subscriber queues |
 | 5.1 | Async Long Polling | ✅ Complete | Waiting costs a scheduled task, not a thread; durable-by-default log directory |
-| 6 | Partitioned Log | ⏳ Planned | Kafka-style retained log with per-group offsets, retention, partitions |
+| 6 | Retained Log | ✅ Complete | Kafka-style log — one copy, N cursors, retention, offset commit |
+| 7 | Partitions | ⏳ Planned | Key-based routing, partition assignment, rebalancing |
 
 ---
 
@@ -400,6 +414,110 @@ curl localhost:8080/queues/analytics/messages   # different receiptHandle
 
 ---
 
+## Phase 6 — The Retained Log
+
+### The Problem Phase 5 Left Open
+
+Fan-out gets you multiple consumer groups by *duplicating* each message into N queues. A group that joins later gets nothing, because the topic keeps no history — and nobody can ever re-read anything.
+
+A log fixes both by not deleting on read.
+
+### Destructive vs Non-Destructive Read
+
+| | `MessageQueue` (Phases 1–5) | `MessageLog` (Phase 6) |
+|---|---|---|
+| Read | `messages.poll()` — removal **is** consumption | `records.get(offset)` — read mutates nothing |
+| Deletion | On acknowledge | On retention policy only |
+| Multiple groups | Duplicate the message per group | One copy, one cursor per group |
+| Progress | A receipt handle per message | One integer per group |
+| Replay | Impossible | Seek to any retained offset |
+
+Every other difference follows from that first row. `MessageLog` sits **beside** `MessageQueue`, not replacing it — having both models in one codebase is the point of having built fan-out first.
+
+### What a Log Deliberately Does Not Have
+
+No visibility timeout. No NACK. No dead letter queue. No in-flight tracking.
+
+A log has exactly one progress mechanism — the committed offset — so none of the Phase 2 machinery applies. This is stated in the class javadoc rather than left to be discovered, because it is not a gap to fill in later. It is the difference between the two models.
+
+A consequence worth feeling: a poison record blocks its group until somebody skips past it. That is a real Kafka operational problem, and it exists precisely because there is no DLQ to divert it to.
+
+### The Central Idea: Two Cursors
+
+Each group has a **position** (in-memory, advanced by `poll`, lost on restart) and a **committed** offset (durable, moved only by `commit`). The distance between them is the entirety of delivery semantics:
+
+| Commit timing | Crash behaviour | Guarantee |
+|---|---|---|
+| Commit before processing | Records never seen again — lost | At-most-once |
+| Commit after processing | Records reprocessed | At-least-once |
+
+Keeping them as separate operations is what makes that choice visible instead of hidden, and two tests in `ConsumerGroupTest` pin both halves. The second one **asserts the data loss** — demonstrating the failure is the lesson, not something to design around.
+
+There is a related off-by-one the API tries to prevent: commit `nextOffset`, not the offset of the last record you read. Committing the latter redelivers that record forever, and there is a test for it.
+
+### Retention, and Losing Data on Purpose
+
+Retention is the only thing that removes records — by count or by age, via a `RetentionScanner` daemon mirroring `VisibilityScanner`.
+
+It is deliberately **blind to consumer progress**: a slow group does not hold records back. That is exactly what makes offset-out-of-range reachable, and all three responses are implemented:
+
+| Policy | Behaviour |
+|---|---|
+| `EARLIEST` | Rewind to the oldest retained record — reprocess what is left |
+| `LATEST` | Jump to the end — skip the gap and accept the loss |
+| `ERROR` | Refuse, and make the operator decide |
+
+A slow consumer group silently losing data is one of the genuine hazards of running Kafka. Making all three reachable and testing each is most of the value of implementing retention at all.
+
+Trimming advances `baseOffset` rather than renumbering, so an offset always means the same record for the life of the log and is never reused.
+
+### Persistence: The File *Is* The Log
+
+Phase 3's WAL was a side-record of queue state, replayed to rebuild it. Here the file is not a record of the data — it **is** the data, and replay is simply reading it back.
+
+That is the same realisation from the other direction: **a Kafka topic is a write-ahead log that nobody deletes from.** Phase 3 built a WAL to make a queue durable; Phase 6 notices that if you stop deleting, you have Kafka.
+
+Committed offsets live in a shared `_offsets.log`, mirroring Kafka's `__consumer_offsets` — which is itself just another log.
+
+### API
+
+| Method | Path | Response |
+|---|---|---|
+| `GET` | `/logs` | `200` `{"logs":["events"]}` |
+| `POST` | `/logs/{name}` | `201` — optional `retentionMs`, `maxRecords`, `resetPolicy` |
+| `DELETE` | `/logs/{name}` | `204` — takes the log's committed offsets with it |
+| `POST` | `/logs/{name}/records` | `201` `{"offset":"42"}` |
+| `GET` | `/logs/{name}/records?group=g&max=n` | `200` records + offsets, `204` if nothing new |
+| `POST` | `/logs/{name}/groups/{g}/commit` | `204` — body `{"offset":42}` |
+| `GET` | `/logs/{name}/groups/{g}` | `200` committed, beginOffset, endOffset, **lag** |
+| `POST` | `/logs/{name}/groups/{g}/seek` | `204` — `{"offset":n}` or `{"position":"earliest"}` |
+
+Note what is **absent**: no acknowledge, no receipt handle. Progress is one integer, committed explicitly. The shape of the API is itself the lesson.
+
+### Try It
+
+```bash
+curl -X POST localhost:8080/logs/events
+curl -X POST localhost:8080/logs/events/records -d '{"payload":"e1"}'
+curl -X POST localhost:8080/logs/events/records -d '{"payload":"e2"}'
+
+curl 'localhost:8080/logs/events/records?group=billing'    # both records
+curl 'localhost:8080/logs/events/records?group=analytics'  # the SAME records
+
+curl localhost:8080/logs/events/groups/billing             # lag: 2
+curl -X POST localhost:8080/logs/events/groups/billing/commit -d '{"offset":2}'
+curl localhost:8080/logs/events/groups/billing             # lag: 0
+
+# rewind and read it all again
+curl -X POST localhost:8080/logs/events/groups/billing/seek -d '{"position":"earliest"}'
+```
+
+### Known Limitation
+
+A poll response contains an array of records, and `JsonUtils` is a flat parser that rejects nesting by design. This is the first place in the project where the hand-written parser has met its limit — a log batch is inherently a list. The server writes the nested response correctly; the parser cannot read it back. Logged as tech debt rather than papered over.
+
+---
+
 ## Getting Started
 
 **Prerequisites**
@@ -435,7 +553,7 @@ MessageQueue queue = manager.createQueue("orders", config);
 ## Test Results
 
 ```
-Tests run: 218, Failures: 0, Errors: 0, Skipped: 0
+Tests run: 306, Failures: 0, Errors: 0, Skipped: 0
 
 ├── MessageTest                    4 tests  — value object correctness, concurrent ID uniqueness
 ├── MessageQueueTest              12 tests  — blocking consume, timed consume, ACK, concurrency
@@ -450,8 +568,13 @@ Tests run: 218, Failures: 0, Errors: 0, Skipped: 0
 ├── TopicPersistenceTest          12 tests  — subscriptions survive restart, compaction, torn writes
 ├── AsyncConsumeTest              14 tests  — callback consume, cancellation, publish/cancel races
 ├── DefaultLogDirectoryTest        6 tests  — server-wide persistence default, DLQ inheritance
+├── MessageLogTest                21 tests  — append, offsets, non-destructive read, seek, lag
+├── ConsumerGroupTest             14 tests  — position vs committed, at-least-once vs at-most-once
+├── RetentionTest                 13 tests  — trimming, baseOffset advance, all three reset policies
+├── LogPersistenceTest            17 tests  — records and offsets survive restart, trims do not undo
 ├── QueueServerTest               22 tests  — HTTP round-trip, long polling under a starved thread pool
 ├── TopicServerTest               20 tests  — topic endpoints, fan-out over HTTP, the 405 asymmetry
+├── LogServerTest                 23 tests  — log endpoints, commit and lag, absence of acknowledge
 ├── ConcurrentStressTest           3 tests  — 5.1M messages, sustained load, backlog draining
 └── DeliveryGuaranteesStressTest   5 tests  — concurrent NACKs, scanner + consumers, DLQ cycles
 ```
@@ -518,3 +641,12 @@ Consumed:  5,093,389
 - Writing a test that fails on the old implementation, because one that passes on both proves nothing
 - Handing work to a callback outside the lock — the dead-letter rule generalised to all caller code
 - Defaults as a durability strategy: the safe thing should not require remembering
+
+**Phase 6**
+- Destructive versus non-destructive read, and why every other difference follows from it
+- Position versus committed offset — where at-most-once and at-least-once actually come from
+- Why commit-the-next-offset, not the last one you read
+- Retention as the only deletion, and deliberately blind to consumer progress
+- Offset out of range, and that a reset policy is a choice about acceptable data loss
+- That a Kafka topic is simply a write-ahead log nobody deletes from
+- Recognising when a format (flat JSON) has outgrown its parser

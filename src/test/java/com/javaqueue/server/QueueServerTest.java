@@ -22,6 +22,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import com.javaqueue.core.Message;
+import com.javaqueue.core.LogManager;
 import com.javaqueue.core.QueueManager;
 import com.javaqueue.core.TopicManager;
 import com.javaqueue.json.JsonUtils;
@@ -240,7 +241,7 @@ class QueueServerTest {
 
         QueueManager ownManager = new QueueManager();
         QueueServer smallServer = new QueueServer(ownManager,
-                new TopicManager(ownManager), 0, maxThreads);
+                new TopicManager(ownManager), new LogManager(), 0, maxThreads);
         smallServer.start();
         String url = "http://localhost:" + smallServer.getPort();
 

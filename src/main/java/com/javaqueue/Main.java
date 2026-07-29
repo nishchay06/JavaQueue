@@ -1,5 +1,6 @@
 package com.javaqueue;
 
+import com.javaqueue.core.LogManager;
 import com.javaqueue.core.QueueManager;
 import com.javaqueue.core.TopicManager;
 import com.javaqueue.server.QueueServer;
@@ -17,13 +18,15 @@ public class Main {
         // and an auto-created DLQ could never be durable at all.
         QueueManager queues = new QueueManager(logDir);
         TopicManager topics = new TopicManager(queues, logDir);
-        QueueServer server = new QueueServer(queues, topics, port);
+        LogManager logs = new LogManager(logDir);
+        QueueServer server = new QueueServer(queues, topics, logs, port);
 
         // Stop the server on Ctrl-C so queue close() runs and the WAL is flushed.
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             try {
                 server.stop();
                 topics.close();
+                logs.close();
             } catch (Exception e) {
                 System.err.println("WARNING: Error during shutdown: " + e.getMessage());
             }
@@ -46,6 +49,15 @@ public class Main {
         System.out.println("  curl -X POST localhost:" + port + "/topics/orders-events/subscriptions/orders");
         System.out.println("  curl -X POST localhost:" + port + "/topics/orders-events/messages "
                 + "-d '{\"payload\":\"Order #1\"}'");
+        System.out.println();
+        System.out.println("  # log: retained, every group reads everything, rewind at will");
+        System.out.println("  curl -X POST localhost:" + port + "/logs/events");
+        System.out.println("  curl -X POST localhost:" + port + "/logs/events/records "
+                + "-d '{\"payload\":\"Event #1\"}'");
+        System.out.println("  curl 'localhost:" + port + "/logs/events/records?group=billing'");
+        System.out.println("  curl -X POST localhost:" + port + "/logs/events/groups/billing/commit "
+                + "-d '{\"offset\":1}'");
+        System.out.println("  curl localhost:" + port + "/logs/events/groups/billing   # lag");
 
         server.join();
     }
