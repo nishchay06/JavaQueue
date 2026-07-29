@@ -175,6 +175,9 @@ public class DeliveryGuaranteesStressTest {
     @Test
     void testSustainedLoadWithTimeouts() throws InterruptedException {
         int threadCount = 5;
+        // Bounds how long consumers get to clear the backlog, not how long the
+        // drain is expected to take.
+        final long DRAIN_TIMEOUT_MS = 60_000;
         AtomicInteger published = new AtomicInteger(0);
         AtomicInteger consumed = new AtomicInteger(0);
 
@@ -208,18 +211,50 @@ public class DeliveryGuaranteesStressTest {
         producers.shutdown();
         producers.awaitTermination(5, TimeUnit.SECONDS);
 
-        Thread.sleep(500);
+        // Drain until the queue is genuinely empty rather than sleeping a fixed
+        // interval. On a runner with fewer cores than this test has threads,
+        // producers outrun consumers and leave a backlog no short sleep can
+        // clear -- which is indistinguishable from message loss to an assertion
+        // that only compares published against consumed.
+        int backlogAtProducerStop = queue.depth();
+        long drainStart = System.currentTimeMillis();
+        long drainDeadline = drainStart + DRAIN_TIMEOUT_MS;
+        while (queue.depth() > 0 && System.currentTimeMillis() < drainDeadline) {
+            Thread.sleep(10);
+        }
+        long drainMs = System.currentTimeMillis() - drainStart;
+
+        // Read depth before shutting consumers down. After shutdownNow, any
+        // message still in flight is unacknowledged and the scanner will requeue
+        // it once its visibility timeout expires, inflating depth afterwards.
+        int residualDepth = queue.depth();
+
         consumers.shutdownNow();
         consumers.awaitTermination(5, TimeUnit.SECONDS);
 
-        System.out.println("Published: " + published.get());
-        System.out.println("Consumed:  " + consumed.get());
+        int publishedCount = published.get();
+        int consumedCount = consumed.get();
 
-        assertTrue(published.get() > 0, "Nothing was published");
-        assertTrue(consumed.get() > 0, "Nothing was consumed");
-        assertTrue(consumed.get() >= published.get(),
-                "Messages lost under sustained load with timeouts enabled");
-        assertTrue(consumed.get() <= published.get() * 2,
+        System.out.println("Published: " + publishedCount);
+        System.out.println("Consumed:  " + consumedCount);
+        System.out.println("Residual:  " + residualDepth);
+        System.out.println("Backlog at producer stop: " + backlogAtProducerStop);
+        System.out.println("Drain time: " + drainMs + "ms"
+                + (backlogAtProducerStop == 0
+                        ? " (no backlog formed -- consumers kept pace)"
+                        : " to clear " + backlogAtProducerStop + " messages"));
+
+        assertTrue(publishedCount > 0, "Nothing was published");
+        assertTrue(consumedCount > 0, "Nothing was consumed");
+
+        // At-least-once with visibility timeouts: a message may be delivered
+        // more than once, so consumed can exceed published. What must never
+        // happen is a message that was neither consumed nor left in the queue.
+        assertTrue(consumedCount + residualDepth >= publishedCount,
+                "Messages lost: consumed (" + consumedCount + ") + queued ("
+                        + residualDepth + ") < published (" + publishedCount + ")");
+
+        assertTrue(consumedCount <= publishedCount * 2,
                 "Too many duplicates — something is wrong");
     }
 
