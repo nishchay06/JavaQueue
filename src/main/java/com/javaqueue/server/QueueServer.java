@@ -4,6 +4,7 @@ import org.eclipse.jetty.server.Server;
 import org.eclipse.jetty.server.ServerConnector;
 import org.eclipse.jetty.util.thread.QueuedThreadPool;
 
+import com.javaqueue.core.LogManager;
 import com.javaqueue.core.QueueManager;
 import com.javaqueue.core.TopicManager;
 
@@ -22,7 +23,12 @@ public class QueueServer {
     private final QueueHandler handler;
 
     public QueueServer(QueueManager queueManager, TopicManager topicManager, int port) {
-        this(queueManager, topicManager, port, 0);
+        this(queueManager, topicManager, new LogManager(), port, 0);
+    }
+
+    public QueueServer(QueueManager queueManager, TopicManager topicManager,
+            LogManager logManager, int port) {
+        this(queueManager, topicManager, logManager, port, 0);
     }
 
     /**
@@ -31,7 +37,7 @@ public class QueueServer {
      *                   polling holds no thread per waiting client.
      */
     public QueueServer(QueueManager queueManager, TopicManager topicManager,
-            int port, int maxThreads) {
+            LogManager logManager, int port, int maxThreads) {
         this.server = maxThreads > 0
                 ? new Server(new QueuedThreadPool(maxThreads))
                 : new Server();
@@ -42,7 +48,7 @@ public class QueueServer {
         this.connector.setPort(port);
         this.server.addConnector(connector);
 
-        this.handler = new QueueHandler(queueManager, topicManager);
+        this.handler = new QueueHandler(queueManager, topicManager, logManager);
         this.server.setHandler(handler);
     }
 

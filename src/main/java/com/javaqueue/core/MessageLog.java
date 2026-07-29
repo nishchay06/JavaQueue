@@ -1,5 +1,6 @@
 package com.javaqueue.core;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -64,6 +65,11 @@ public class MessageLog {
 
     private final Thread retentionThread;
 
+    // Null when no log directory is configured — no persistence, same
+    // convention as QueueConfig.logDirectory.
+    private RecordStore recordStore;
+    private OffsetStore offsetStore;
+
     /** A consumer group's two cursors. Guarded by the enclosing monitor. */
     private static final class GroupState {
         private long position;
@@ -87,6 +93,19 @@ public class MessageLog {
         this.name = name;
         this.config = config;
 
+        if (config.getLogDirectory() != null) {
+            synchronized (this) {
+                replay(RecordStore.read(config.getLogDirectory(), name));
+            }
+            try {
+                this.recordStore = new RecordStore(config.getLogDirectory(), name);
+                compactRecordFile();
+            } catch (IOException e) {
+                System.err.println("WARNING: Could not open log file for '" + name
+                        + "': " + e.getMessage());
+            }
+        }
+
         RetentionScanner scanner = new RetentionScanner(this, scanIntervalMs);
         this.retentionThread = new Thread(scanner, "retention-" + name);
         this.retentionThread.setDaemon(true);
@@ -104,6 +123,10 @@ public class MessageLog {
         synchronized (this) {
             long offset = baseOffset + records.size();
             records.add(new Entry(message, System.currentTimeMillis()));
+
+            if (recordStore != null) {
+                recordStore.append(RecordStore.Entry.appended(offset, message));
+            }
 
             // Size is enforced immediately so maxRecords is a hard bound
             // rather than one that holds only between scanner ticks. Age is
@@ -191,6 +214,10 @@ public class MessageLog {
                 throw new OffsetOutOfRangeException(name, offset, baseOffset, endOffset());
             }
             groupState(group).committed = offset;
+
+            if (offsetStore != null) {
+                offsetStore.record(name, group, offset);
+            }
         }
     }
 
@@ -258,6 +285,14 @@ public class MessageLog {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
+        if (recordStore != null) {
+            try {
+                recordStore.close();
+            } catch (IOException e) {
+                System.err.println("WARNING: Could not close log file for '" + name
+                        + "': " + e.getMessage());
+            }
+        }
     }
 
     // ── Internals ─────────────────────────────────────────────────────────────
@@ -295,6 +330,57 @@ public class MessageLog {
         }
         records.subList(0, count).clear();
         baseOffset += count;
+
+        // Record the trim so a restart does not resurrect what retention
+        // removed. One small line, rather than rewriting the whole file on
+        // every trim.
+        if (recordStore != null) {
+            recordStore.append(RecordStore.Entry.trimmed(baseOffset));
+        }
+    }
+
+    // Rebuilds records and baseOffset from the file. Caller MUST hold the
+    // monitor. A TRIM sets the base offset and drops anything before it.
+    private void replay(List<RecordStore.Entry> entries) {
+        for (RecordStore.Entry entry : entries) {
+            if (entry.append()) {
+                records.add(new Entry(new Message(entry.messageId(), entry.payload()),
+                        System.currentTimeMillis()));
+                continue;
+            }
+            long newBase = entry.offset();
+            int drop = (int) Math.min(Math.max(newBase - baseOffset, 0), records.size());
+            records.subList(0, drop).clear();
+            baseOffset = newBase;
+        }
+    }
+
+    // Collapses the file to current state after replay, so trims and rewrites
+    // do not accumulate across restarts.
+    private void compactRecordFile() {
+        synchronized (this) {
+            List<RecordStore.Entry> survivors = new ArrayList<>(records.size());
+            for (int i = 0; i < records.size(); i++) {
+                survivors.add(RecordStore.Entry.appended(baseOffset + i, records.get(i).message()));
+            }
+            recordStore.compact(baseOffset, survivors);
+        }
+    }
+
+    // Wires up durable offsets and restores what a group had committed.
+    // Called by LogManager immediately after construction.
+    void attachOffsetStore(OffsetStore store) {
+        synchronized (this) {
+            this.offsetStore = store;
+        }
+    }
+
+    void restoreCommitted(String group, long offset) {
+        synchronized (this) {
+            GroupState state = groupState(group);
+            state.committed = offset;
+            state.position = offset;
+        }
     }
 
     // Caller MUST hold the monitor. Groups are created on first use, starting
