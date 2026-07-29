@@ -530,7 +530,11 @@ The interesting behaviours here are all visual over time, which is why they are 
 
 Buttons publish, consume, append, commit and rewind, so the whole system is drivable without a terminal. The activity feed shows every request and response, including failures.
 
-It is served by the same Jetty as the API, so the page is same-origin and needs no cross-origin arrangement. Everything is inlined — no CDN, no external stylesheet — matching the project's no-dependencies philosophy, and it works offline.
+Lag carries the visual weight it deserves: a bar coloured by severity, thresholded against the log's own offset span, so a group falling behind reads at a glance rather than requiring you to compare two numbers.
+
+It is served by the same Jetty as the API, so the page is same-origin and needs no cross-origin arrangement. Everything is inlined — no CDN, no webfonts, no external stylesheet — matching the project's no-dependencies philosophy, and it works offline. Light and dark are both designed, via token redefinition rather than inverting.
+
+The page shows nothing until `/stats` answers, and never invents figures: if a later poll fails it keeps the last real numbers and says plainly that they are stale.
 
 `GET /stats` returns the whole snapshot in one call. That is deliberate: a request per resource would mean N+1 round trips and a page rendering torn state, with queues from one instant beside logs from another.
 
