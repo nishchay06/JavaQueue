@@ -134,10 +134,13 @@ public class ConcurrentStressTest {
         // interval and hoping. On a machine with fewer cores than this test has
         // threads, producers outrun consumers and leave a backlog that a short
         // sleep will not clear -- which looks identical to message loss.
-        long drainDeadline = System.currentTimeMillis() + DRAIN_TIMEOUT_MS;
+        int backlogAtProducerStop = queue.depth();
+        long drainStart = System.currentTimeMillis();
+        long drainDeadline = drainStart + DRAIN_TIMEOUT_MS;
         while (queue.depth() > 0 && System.currentTimeMillis() < drainDeadline) {
             Thread.sleep(10);
         }
+        long drainMs = System.currentTimeMillis() - drainStart;
 
         consumers.shutdownNow();
         consumers.awaitTermination(5, TimeUnit.SECONDS);
@@ -150,6 +153,15 @@ public class ConcurrentStressTest {
         System.out.println("Published: " + publishedCount);
         System.out.println("Consumed:  " + consumedCount);
         System.out.println("Residual:  " + residualDepth);
+
+        // Without these two, a passing run is ambiguous: a drain of ~0ms means
+        // no backlog ever formed and the drain loop was never actually
+        // exercised, which is a different result from a backlog that cleared.
+        System.out.println("Backlog at producer stop: " + backlogAtProducerStop);
+        System.out.println("Drain time: " + drainMs + "ms"
+                + (backlogAtProducerStop == 0
+                        ? " (no backlog formed -- consumers kept pace)"
+                        : " to clear " + backlogAtProducerStop + " messages"));
 
         assertTrue(publishedCount > 0, "Nothing was published");
         assertTrue(consumedCount > 0, "Nothing was consumed");
